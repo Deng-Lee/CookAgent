@@ -66,6 +66,26 @@ def chunk_records(path: Path, *, strict: bool) -> List[dict]:
     """Split one markdown file and build records for Chroma upsert."""
     chunks: List[Chunk] = split_file(path, strict=strict)
     records: List[dict] = []
+    total_chunks = len(chunks)
+    # Inject a title-only chunk to boost dish name recall.
+    if chunks:
+        dish_name = chunks[0].meta.get("dish_name", path.stem)
+        title_text = f"[菜名: {dish_name}] [类别: Title] {dish_name}"
+        total_chunks_with_title = total_chunks + 1
+        records.append(
+            {
+                "id": f"{path.stem}-title",
+                "text": title_text,
+                "metadata": {
+                    "dish_name": dish_name,
+                    "category": "Title",
+                    "parent_id": str(path),
+                    "chunk_index": -1,
+                    "total_chunks": total_chunks_with_title,
+                },
+            }
+        )
+    total_chunks_with_title = total_chunks + (1 if chunks else 0)
     for idx, chunk in enumerate(chunks):
         doc_id = f"{path.stem}-{idx}-{uuid4().hex[:8]}"
         records.append(
@@ -76,6 +96,7 @@ def chunk_records(path: Path, *, strict: bool) -> List[dict]:
                     **chunk.meta,
                     "parent_id": chunk.parent_id,
                     "chunk_index": idx,
+                    "total_chunks": total_chunks_with_title,
                 },
             }
         )
