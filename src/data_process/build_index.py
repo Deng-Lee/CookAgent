@@ -14,6 +14,7 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from typing import Iterable, List
 from uuid import uuid4
@@ -22,6 +23,38 @@ import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 from splitter import Chunk, split_file
+
+LOCAL_MODEL_ENV = "LOCAL_BGE_M3_PATH"
+
+
+def resolve_local_model_path() -> str:
+    """
+    Resolve local path to BAAI/bge-m3 snapshot to avoid network calls.
+    Priority:
+    1) Env LOCAL_BGE_M3_PATH if set and exists.
+    2) Latest snapshot under ~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/<hash> that contains config.json
+    3) Fallback to ~/.cache/huggingface/hub/models--BAAI--bge-m3 if it contains config.json
+    """
+    env_path = os.environ.get(LOCAL_MODEL_ENV)
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.exists():
+            return str(p)
+    root = Path.home() / ".cache" / "huggingface" / "hub" / "models--BAAI--bge-m3"
+    snapshots_root = root / "snapshots"
+    if snapshots_root.exists():
+        snapshots = sorted(
+            [p for p in snapshots_root.glob("*") if (p / "config.json").exists()],
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        if snapshots:
+            return str(snapshots[0])
+    if root.exists() and (root / "config.json").exists():
+        return str(root)
+    raise FileNotFoundError(
+        f"Local BGE model not found. Set {LOCAL_MODEL_ENV} to the model directory or ensure HF cache exists."
+    )
 
 
 def iter_markdown_files(root: Path) -> Iterable[Path]:
@@ -57,7 +90,11 @@ def build_collection(
     strict: bool = False,
 ) -> None:
     """Traverse all recipes, split, and upsert embeddings into Chroma."""
-    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="BAAI/bge-m3")
+    model_path = resolve_local_model_path()
+    embedding_fn = SentenceTransformerEmbeddingFunction(
+        model_name=model_path,
+        model_kwargs={"local_files_only": True},
+    )
     client = chromadb.PersistentClient(path=str(db_path))
     collection = client.get_or_create_collection(
         name=collection_name,
