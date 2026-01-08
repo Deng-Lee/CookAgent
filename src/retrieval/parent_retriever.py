@@ -68,7 +68,11 @@ def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Pat
     metadatas = res["metadatas"][0]
     distances = res["distances"][0]
     vector_topk = []
+    seen_chunk_ids = set()
     for idx, (hit_id, doc, meta, dist) in enumerate(zip(ids, documents, metadatas, distances), start=1):
+        if hit_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(hit_id)
         vector_topk.append(
             {
                 "chunk_id": hit_id,
@@ -143,8 +147,12 @@ def aggregate_hits(
     documents = res["documents"][0]
     metadatas = res["metadatas"][0]
     distances = res["distances"][0]
+    seen_chunk_ids = set()
 
     for idx, (hit_id, doc, meta, dist) in enumerate(zip(ids, documents, metadatas, distances)):
+        if hit_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(hit_id)
         parent_id = meta.get("parent_id")
         if parent_id is None:
             continue
