@@ -157,3 +157,24 @@ def log_evidence_insufficient(
     }
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_evidence_routing(
+    trace_id: str,
+    turn: Optional[int],
+    query: str,
+    routing: Dict,
+    *,
+    log_path: Path = DEFAULT_EVIDENCE_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "span_name": "evidence_routing",
+        "trace_id": trace_id,
+        "turn": turn,
+        "query": query,
+        "routing": routing,
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")

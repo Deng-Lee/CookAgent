@@ -8,6 +8,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 from retrieval_types import ParentHit
 from model_utils import resolve_local_model_path
+from generation_utils import normalize_block_type, BLOCK_CANONICAL_TO_ORIG
 
 
 def build_evidence_set(parent: ParentHit) -> Dict:
@@ -64,10 +65,13 @@ def build_evidence_set_for_parent(
 def evidence_sufficient(evidence_set: Optional[Dict]) -> Tuple[bool, List[str]]:
     if not evidence_set:
         return False, ["Ingredients", "Operation"]
-    block_types = {c.get("block_type") for c in evidence_set.get("chunks", []) if c.get("block_type")}
-    required = {"Ingredients", "Operation"}
+    block_types = {
+        normalize_block_type(c.get("block_type")) for c in evidence_set.get("chunks", []) if c.get("block_type")
+    }
+    required = {"ingredients", "operation"}
     missing = sorted(required - block_types)
-    return not missing, missing
+    missing_orig = [BLOCK_CANONICAL_TO_ORIG[m] for m in missing]
+    return not missing_orig, missing_orig
 
 
 def format_auto_answer(evidence_set: Optional[Dict]) -> str:
@@ -75,13 +79,13 @@ def format_auto_answer(evidence_set: Optional[Dict]) -> str:
         return "未找到可用证据。"
     grouped: Dict[str, List[str]] = {}
     for chunk in evidence_set.get("chunks", []):
-        block_type = chunk.get("block_type") or "Additional"
-        grouped.setdefault(block_type, []).append(chunk.get("text", ""))
+        canonical = normalize_block_type(chunk.get("block_type")) or "tips"
+        grouped.setdefault(canonical, []).append(chunk.get("text", ""))
     sections = []
     section_order = [
-        ("Ingredients", "原料"),
-        ("Operation", "步骤"),
-        ("Additional", "注意事项"),
+        ("ingredients", "原料"),
+        ("operation", "步骤"),
+        ("tips", "注意事项"),
     ]
     for block_type, label in section_order:
         items = grouped.get(block_type)

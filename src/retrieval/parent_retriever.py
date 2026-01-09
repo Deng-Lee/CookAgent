@@ -31,11 +31,12 @@ from evidence_utils import (
     build_evidence_set_for_parent,
     default_clarify_question,
     evidence_sufficient,
-    extract_first_step,
     format_auto_answer,
 )
+from generation_utils import classify_query, route_blocks, build_layer_evidence, generate_answer
 from logging_utils import (
     log_evidence_built,
+    log_evidence_routing,
     log_evidence_insufficient,
     log_parent_lock,
     log_retrieval,
@@ -440,16 +441,52 @@ def run_session_once(
             evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
             if evidence_log_path:
                 log_evidence_built(query, evidence_set, log_path=evidence_log_path)
+
+            routing = classify_query(query)
+            intent = routing["intent"]
+            confidence = routing["confidence"]
+            slots = routing["slots"]
+            intent_min = 0.5
+            layer1_blocks = route_blocks(intent) if confidence >= intent_min else []
+            selected_blocks = layer1_blocks
+            evidence_layer1 = build_layer_evidence(evidence_set, layer1_blocks) if layer1_blocks else None
+
+            routing_log = {
+                "intent": intent,
+                "confidence": confidence,
+                "selected_blocks_layer1": selected_blocks,
+                "upgraded_to_layer2": False,
+                "final_evidence_chunk_ids": [],
+            }
+
+            answer = None
+            missing_slots: List[str] = []
+            if evidence_layer1 and evidence_layer1.get("chunks"):
+                answer, missing_slots = generate_answer(intent, slots, evidence_layer1)
+                routing_log["final_evidence_chunk_ids"] = [
+                    c.get("chunk_id") for c in evidence_layer1.get("chunks", [])
+                ]
+            else:
+                routing_log["upgraded_to_layer2"] = True
+
+            if (not answer) or missing_slots or routing_log["upgraded_to_layer2"]:
+                routing_log["upgraded_to_layer2"] = True
+                answer, missing_slots = generate_answer(intent, slots, evidence_set)
+                routing_log["final_evidence_chunk_ids"] = [
+                    c.get("chunk_id") for c in evidence_set.get("chunks", [])
+                ]
+
+            if evidence_log_path:
+                log_evidence_routing(
+                    trace_id,
+                    current_turn,
+                    query,
+                    routing_log,
+                    log_path=evidence_log_path,
+                )
+
             sufficient, missing = evidence_sufficient(evidence_set)
-            if sufficient:
-                if "第一步" in query or "第1步" in query:
-                    first_step = extract_first_step(evidence_set)
-                    if first_step:
-                        answer = f"第一步：{first_step}"
-                    else:
-                        answer = format_auto_answer(evidence_set)
-                else:
-                    answer = format_auto_answer(evidence_set)
+            if answer and sufficient:
                 session["last_trace_id"] = trace_id
                 session["updated_at"] = now
                 save_session(session)
@@ -463,6 +500,27 @@ def run_session_once(
             session["last_trace_id"] = trace_id
             session["updated_at"] = now
             save_session(session)
+            if evidence_log_path:
+                log_evidence_insufficient(
+                    query,
+                    current_turn,
+                    ParentLock(
+                        status="locked",
+                        parent_id=parent_id,
+                        lock_reason="auto",
+                        lock_score=session.get("parent_lock", {}).get("lock_score"),
+                        locked_at_turn=current_turn,
+                        pending_reason=None,
+                    ),
+                    evidence_set,
+                    {
+                        "output_intent": intent,
+                        "missing_block_types": [],
+                        "missing_slots": missing_slots or missing,
+                        "decision": {"action": "clarify", "reason": "missing_slots"},
+                    },
+                    log_path=evidence_log_path,
+                )
             return {
                 "trace_id": trace_id,
                 "state": "LOW_EVIDENCE",
