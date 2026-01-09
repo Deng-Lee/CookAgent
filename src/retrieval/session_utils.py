@@ -23,6 +23,7 @@ def load_session(session_id: str) -> Dict:
             "last_trace_id": None,
             "parent_lock": {"status": "none", "parent_id": None, "pending_reason": None, "lock_score": None},
             "pending_candidates": [],
+            "parent_cache": None,
             "ttl_seconds": 900,
             "updated_at": None,
         }

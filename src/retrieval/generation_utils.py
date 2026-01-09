@@ -138,6 +138,9 @@ def generate_answer(
     intent: str,
     slots: Dict[str, int],
     evidence_set: Dict,
+    *,
+    parsed_steps: Optional[List[str]] = None,
+    parsed_ingredients: Optional[List[str]] = None,
 ) -> Tuple[Optional[str], List[str]]:
     chunks = evidence_set.get("chunks", [])
     op_texts = [c.get("text", "") for c in chunks if normalize_block_type(c.get("block_type")) == "operation"]
@@ -145,19 +148,19 @@ def generate_answer(
     add_texts = [c.get("text", "") for c in chunks if normalize_block_type(c.get("block_type")) == "tips"]
 
     if intent == "ASK_STEP_N":
-        steps = parse_steps(op_texts)
+        steps = parsed_steps if parsed_steps is not None else parse_steps(op_texts)
         step_n = slots.get("step_n")
         if step_n and 1 <= step_n <= len(steps):
             return f"第{step_n}步：{steps[step_n - 1]}", []
         return None, ["step_n"]
     if intent == "ASK_STEPS":
-        steps = parse_steps(op_texts)
+        steps = parsed_steps if parsed_steps is not None else parse_steps(op_texts)
         if steps:
             preview = steps[:3]
             return "步骤要点：\n" + "\n".join([f"- {s}" for s in preview]), []
         return None, ["steps"]
     if intent == "ASK_INGREDIENTS":
-        items = parse_ingredients(ing_texts)
+        items = parsed_ingredients if parsed_ingredients is not None else parse_ingredients(ing_texts)
         if items:
             return "所需原料：\n" + "\n".join([f"- {i}" for i in items]), []
         return None, ["ingredients"]

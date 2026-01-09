@@ -33,7 +33,15 @@ from evidence_utils import (
     evidence_sufficient,
     format_auto_answer,
 )
-from generation_utils import classify_query, route_blocks, build_layer_evidence, generate_answer
+from generation_utils import (
+    classify_query,
+    route_blocks,
+    build_layer_evidence,
+    generate_answer,
+    parse_steps,
+    parse_ingredients,
+    normalize_block_type,
+)
 from logging_utils import (
     log_evidence_built,
     log_evidence_routing,
@@ -408,6 +416,21 @@ def run_session_once(
             sufficient, missing = evidence_sufficient(evidence_set)
             if lock_log_path:
                 log_parent_lock(query, parent_lock, [], log_path=lock_log_path)
+            op_texts = [
+                c.get("text", "")
+                for c in evidence_set.get("chunks", [])
+                if normalize_block_type(c.get("block_type")) == "operation"
+            ]
+            ing_texts = [
+                c.get("text", "")
+                for c in evidence_set.get("chunks", [])
+                if normalize_block_type(c.get("block_type")) == "ingredients"
+            ]
+            session["parent_cache"] = {
+                "parent_id": parent_id,
+                "parsed_steps": parse_steps(op_texts),
+                "parsed_ingredients": parse_ingredients(ing_texts),
+            }
             session["parent_lock"] = {
                 "status": "locked",
                 "parent_id": parent_id,
@@ -450,28 +473,73 @@ def run_session_once(
             layer1_blocks = route_blocks(intent) if confidence >= intent_min else []
             selected_blocks = layer1_blocks
             evidence_layer1 = build_layer_evidence(evidence_set, layer1_blocks) if layer1_blocks else None
+            parent_cache = session.get("parent_cache") or {}
+            cached_steps = None
+            cached_ingredients = None
+            if parent_cache.get("parent_id") == parent_id:
+                cached_steps = parent_cache.get("parsed_steps")
+                cached_ingredients = parent_cache.get("parsed_ingredients")
+            if cached_steps is None or cached_ingredients is None:
+                op_texts = [
+                    c.get("text", "")
+                    for c in evidence_set.get("chunks", [])
+                    if normalize_block_type(c.get("block_type")) == "operation"
+                ]
+                ing_texts = [
+                    c.get("text", "")
+                    for c in evidence_set.get("chunks", [])
+                    if normalize_block_type(c.get("block_type")) == "ingredients"
+                ]
+                cached_steps = cached_steps if cached_steps is not None else parse_steps(op_texts)
+                cached_ingredients = (
+                    cached_ingredients if cached_ingredients is not None else parse_ingredients(ing_texts)
+                )
+                session["parent_cache"] = {
+                    "parent_id": parent_id,
+                    "parsed_steps": cached_steps,
+                    "parsed_ingredients": cached_ingredients,
+                }
 
             routing_log = {
                 "intent": intent,
                 "confidence": confidence,
                 "selected_blocks_layer1": selected_blocks,
                 "upgraded_to_layer2": False,
+                "upgrade_reason": None,
                 "final_evidence_chunk_ids": [],
             }
 
             answer = None
             missing_slots: List[str] = []
-            if evidence_layer1 and evidence_layer1.get("chunks"):
-                answer, missing_slots = generate_answer(intent, slots, evidence_layer1)
+            if confidence < intent_min:
+                routing_log["upgraded_to_layer2"] = True
+                routing_log["upgrade_reason"] = "low_confidence"
+            elif not evidence_layer1 or not evidence_layer1.get("chunks"):
+                routing_log["upgraded_to_layer2"] = True
+                routing_log["upgrade_reason"] = "missing_block"
+            else:
+                answer, missing_slots = generate_answer(
+                    intent,
+                    slots,
+                    evidence_layer1,
+                    parsed_steps=cached_steps,
+                    parsed_ingredients=cached_ingredients,
+                )
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_layer1.get("chunks", [])
                 ]
-            else:
-                routing_log["upgraded_to_layer2"] = True
+                if (not answer) or missing_slots:
+                    routing_log["upgraded_to_layer2"] = True
+                    routing_log["upgrade_reason"] = "no_hit_sentence"
 
-            if (not answer) or missing_slots or routing_log["upgraded_to_layer2"]:
-                routing_log["upgraded_to_layer2"] = True
-                answer, missing_slots = generate_answer(intent, slots, evidence_set)
+            if routing_log["upgraded_to_layer2"]:
+                answer, missing_slots = generate_answer(
+                    intent,
+                    slots,
+                    evidence_set,
+                    parsed_steps=cached_steps,
+                    parsed_ingredients=cached_ingredients,
+                )
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_set.get("chunks", [])
                 ]
@@ -562,6 +630,7 @@ def run_session_once(
             "lock_score": top1_score,
         }
         session["pending_candidates"] = pending_candidates
+        session["parent_cache"] = None
     else:
         session["parent_lock"] = {
             "status": state.parent_lock.status,
@@ -570,6 +639,8 @@ def run_session_once(
             "lock_score": state.parent_lock.lock_score,
         }
         session["pending_candidates"] = []
+        if state.parent_lock.status != "locked":
+            session["parent_cache"] = None
     session["last_trace_id"] = trace_id
     session["updated_at"] = now
     save_session(session)
