@@ -29,6 +29,8 @@ import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
 LOCAL_MODEL_ENV = "LOCAL_BGE_M3_PATH"
+DEFAULT_LOCK_LOG = Path("logs/parent_locking.log")
+DEFAULT_EVIDENCE_LOG = Path("logs/evidence_driven.log")
 
 
 def resolve_local_model_path() -> str:
@@ -121,6 +123,119 @@ def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Pat
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def log_parent_lock(
+    query: str,
+    parent_lock: ParentLock,
+    parents: List[ParentHit],
+    log_path: Path = DEFAULT_LOCK_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if parent_lock.status == "pending":
+        candidates = [
+            {
+                "parent_id": ph.parent_id,
+                "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
+                "overall_score": ph.overall_score,
+                "top_evidence_snippets": [h.text.replace("\n", " ")[:80] for h in ph.hits[:3]],
+            }
+            for ph in parents
+        ]
+    else:
+        candidates = []
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "span_name": "parent_lock",
+        "query": query,
+        "event": "lock_created"
+        if parent_lock.status == "locked"
+        else "lock_pending"
+        if parent_lock.status == "pending"
+        else "lock_none",
+        "parent_lock": {
+            "status": parent_lock.status,
+            "parent_id": parent_lock.parent_id,
+            "lock_reason": parent_lock.lock_reason,
+            "lock_score": parent_lock.lock_score,
+            "locked_at_turn": parent_lock.locked_at_turn,
+            "pending_reason": parent_lock.pending_reason,
+        },
+        "candidates": candidates,
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def build_evidence_set(parent: ParentHit) -> Dict:
+    seen_chunk_ids = set()
+    chunks = []
+    for hit in parent.hits:
+        chunk_id = hit.metadata.get("chunk_id")
+        if not chunk_id or chunk_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(chunk_id)
+        chunks.append(
+            {
+                "chunk_id": chunk_id,
+                "block_type": hit.metadata.get("category"),
+                "text": hit.text,
+                "score": hit.score,
+            }
+        )
+    return {
+        "parent_id": parent.parent_id,
+        "chunks": chunks,
+    }
+
+
+def log_evidence_event(
+    query: str,
+    evidence_set: Dict,
+    log_path: Path = DEFAULT_EVIDENCE_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    chunk_ids = [c.get("chunk_id") for c in evidence_set.get("chunks", [])]
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "span_name": "evidence_built",
+        "query": query,
+        "evidence_set": {
+            "parent_id": evidence_set.get("parent_id"),
+            "chunk_ids": chunk_ids,
+        },
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_evidence_insufficient(
+    query: str,
+    turn: Optional[int],
+    parent_lock: ParentLock,
+    evidence_set: Dict,
+    payload: Dict,
+    log_path: Path = DEFAULT_EVIDENCE_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_chunks = evidence_set.get("chunks", [])
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "event": "evidence_insufficient",
+        "turn": turn,
+        "query": query,
+        "locked_parent_id": parent_lock.parent_id,
+        "output_intent": payload.get("output_intent"),
+        "evidence_chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+        "evidence_block_types": [
+            c.get("block_type") for c in evidence_chunks if c.get("block_type") is not None
+        ],
+        "missing_block_types": payload.get("missing_block_types", []),
+        "missing_slots": payload.get("missing_slots", []),
+        "decision": payload.get("decision"),
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def _distance_to_score(distance: float) -> float:
     """Convert Chroma distance (cosine) to a similarity score."""
     return 1.0 / (1.0 + distance)
@@ -150,6 +265,16 @@ class ParentHit:
     auto_recommend: bool = False
     hits: List[ChunkHit] = field(default_factory=list)
     parent_doc: Optional[str] = None
+
+
+@dataclass
+class ParentLock:
+    status: str  # locked | pending | none
+    parent_id: Optional[str]
+    lock_reason: Optional[str]
+    lock_score: Optional[float]
+    locked_at_turn: Optional[int]
+    pending_reason: Optional[str]
 
 
 def aggregate_hits(
@@ -211,8 +336,8 @@ def aggregate_hits(
         max_rrf = max(p.rrf_sum for p in eligible)
         min_max = min(p.max_chunk_score for p in eligible)
         max_max = max(p.max_chunk_score for p in eligible)
-        w1 = 0.8
-        w2 = 0.2
+        w1 = 0.7
+        w2 = 0.3
         for ph in eligible:
             ph.rrf_sum_norm = (ph.rrf_sum - min_rrf) / (max_rrf - min_rrf + eps)
             ph.max_chunk_norm = (ph.max_chunk_score - min_max) / (max_max - min_max + eps)
@@ -246,6 +371,10 @@ def retrieve(
     top_k: int = 25,
     top_parents: int = 5,
     log_path: Optional[Path] = None,
+    lock_log_path: Optional[Path] = None,
+    evidence_log_path: Optional[Path] = None,
+    evidence_insufficient: Optional[Dict] = None,
+    turn: Optional[int] = None,
 ) -> List[ParentHit]:
     model_path = resolve_local_model_path()
     embedding_fn = SentenceTransformerEmbeddingFunction(
@@ -264,6 +393,14 @@ def retrieve(
     any_eligible = any(ph.coverage_ratio >= coverage_threshold for ph in parents)
     t_min = 0.40
     auto_recommend = True
+    parent_lock = ParentLock(
+        status="none",
+        parent_id=None,
+        lock_reason=None,
+        lock_score=None,
+        locked_at_turn=turn,
+        pending_reason=None,
+    )
     if not any_eligible:
         for ph in parents:
             ph.low_evidence = True
@@ -282,11 +419,45 @@ def retrieve(
     if auto_recommend:
         for ph in parents:
             ph.auto_recommend = True
+        if parents:
+            parent_lock = ParentLock(
+                status="locked",
+                parent_id=parents[0].parent_id,
+                lock_reason="auto",
+                lock_score=parents[0].overall_score,
+                locked_at_turn=turn,
+                pending_reason=None,
+            )
+    elif parents and parents[0].good_but_ambiguous:
+        parent_lock = ParentLock(
+            status="pending",
+            parent_id=None,
+            lock_reason=None,
+            lock_score=None,
+            locked_at_turn=turn,
+            pending_reason="GOOD_BUT_AMBIGUOUS",
+        )
     for ph in parents[:top_parents]:
         ph.parent_doc = load_parent_doc(ph.parent_id)
 
     if log_path:
         log_retrieval(query, res, parents[:top_parents])
+    if lock_log_path:
+        log_parent_lock(query, parent_lock, parents[:top_parents], log_path=lock_log_path)
+    evidence_set = None
+    if parent_lock.status == "locked" and parents:
+        evidence_set = build_evidence_set(parents[0])
+        if evidence_log_path:
+            log_evidence_event(query, evidence_set, log_path=evidence_log_path)
+    if evidence_insufficient and parent_lock.status == "locked" and evidence_set:
+        log_evidence_insufficient(
+            query,
+            turn,
+            parent_lock,
+            evidence_set,
+            evidence_insufficient,
+            log_path=evidence_log_path or DEFAULT_EVIDENCE_LOG,
+        )
     return parents[:top_parents]
 
 
@@ -298,6 +469,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=25, help="Chunk-level n_results.")
     parser.add_argument("--top-parents", type=int, default=5, help="How many parent docs to return.")
     parser.add_argument("--log-path", type=Path, default=Path("logs/retriever.log"), help="Path to append JSON logs.")
+    parser.add_argument(
+        "--lock-log-path",
+        type=Path,
+        default=DEFAULT_LOCK_LOG,
+        help="Path to append parent lock logs.",
+    )
+    parser.add_argument(
+        "--evidence-log-path",
+        type=Path,
+        default=DEFAULT_EVIDENCE_LOG,
+        help="Path to append evidence-driven logs.",
+    )
+    parser.add_argument(
+        "--turn",
+        type=int,
+        default=None,
+        help="Conversation turn index for parent locking logs.",
+    )
     return parser.parse_args()
 
 
@@ -314,6 +503,9 @@ def main() -> None:
         top_k=args.top_k,
         top_parents=args.top_parents,
         log_path=args.log_path,
+        lock_log_path=args.lock_log_path,
+        evidence_log_path=args.evidence_log_path,
+        turn=args.turn,
     )
     for i, ph in enumerate(parents, 1):
         print(
