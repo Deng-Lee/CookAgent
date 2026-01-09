@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from retrieval_types import ParentHit, ParentLock, DEFAULT_EVIDENCE_LOG, DEFAULT_LOCK_LOG
+from retrieval_types import (
+    ParentHit,
+    ParentLock,
+    DEFAULT_EVIDENCE_LOG,
+    DEFAULT_LOCK_LOG,
+    DEFAULT_GENERATION_LOG,
+)
 
 
 def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Path = Path("logs/retriever.log")) -> None:
@@ -176,5 +182,38 @@ def log_evidence_routing(
         "query": query,
         "routing": routing,
     }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_generation_started(
+    record: Dict,
+    log_path: Path = DEFAULT_GENERATION_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record["event"] = "generation_started"
+    record["ts"] = datetime.datetime.utcnow().isoformat() + "Z"
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_generation_completed(
+    record: Dict,
+    log_path: Path = DEFAULT_GENERATION_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record["event"] = "generation_completed"
+    record["ts"] = datetime.datetime.utcnow().isoformat() + "Z"
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def log_generation_mapping(
+    record: Dict,
+    log_path: Path = DEFAULT_GENERATION_LOG,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record["event"] = "generation_mapping"
+    record["ts"] = datetime.datetime.utcnow().isoformat() + "Z"
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")

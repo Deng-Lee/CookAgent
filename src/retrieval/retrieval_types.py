@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 
 DEFAULT_LOCK_LOG = Path("logs/parent_locking.log")
 DEFAULT_EVIDENCE_LOG = Path("logs/evidence_driven.log")
+DEFAULT_GENERATION_LOG = Path("logs/generation.log")
 DEFAULT_SESSION_DIR = Path("logs/sessions")
 
 

@@ -186,3 +186,36 @@ def generate_answer(
         return None, ["tips"]
 
     return None, ["unknown_intent"]
+
+
+def output_intent_for(intent: str, slots: Dict[str, int]) -> str:
+    if intent == "ASK_STEP_N":
+        return "step_n"
+    if intent == "ASK_STEPS":
+        return "steps_overview"
+    if intent == "ASK_INGREDIENTS":
+        return "ingredients_only"
+    if intent == "ASK_TIPS":
+        return "tips_only"
+    if intent in {"ASK_TIME", "ASK_HEAT", "ASK_SUBSTITUTION"}:
+        return "qa"
+    return "full_recipe"
+
+
+def build_generation_mapping(output_intent: str, evidence_set: Dict) -> List[Dict]:
+    chunks = evidence_set.get("chunks", []) if evidence_set else []
+    by_block: Dict[str, List[str]] = {}
+    for chunk in chunks:
+        cid = chunk.get("chunk_id")
+        if not cid:
+            continue
+        canonical = normalize_block_type(chunk.get("block_type")) or "tips"
+        by_block.setdefault(canonical, []).append(cid)
+    sections = []
+    if output_intent in {"ingredients_only", "full_recipe"}:
+        sections.append({"section": "ingredients", "used_chunk_ids": by_block.get("ingredients", [])})
+    if output_intent in {"steps_overview", "step_n", "full_recipe", "qa"}:
+        sections.append({"section": "steps", "used_chunk_ids": by_block.get("operation", [])})
+    if output_intent in {"tips_only", "full_recipe"}:
+        sections.append({"section": "tips", "used_chunk_ids": by_block.get("tips", [])})
+    return [s for s in sections if s["used_chunk_ids"]]

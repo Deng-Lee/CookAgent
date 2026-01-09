@@ -41,6 +41,8 @@ from generation_utils import (
     parse_steps,
     parse_ingredients,
     normalize_block_type,
+    output_intent_for,
+    build_generation_mapping,
 )
 from logging_utils import (
     log_evidence_built,
@@ -48,6 +50,9 @@ from logging_utils import (
     log_evidence_insufficient,
     log_parent_lock,
     log_retrieval,
+    log_generation_started,
+    log_generation_completed,
+    log_generation_mapping,
 )
 from model_utils import resolve_local_model_path
 from retrieval_types import (
@@ -57,6 +62,7 @@ from retrieval_types import (
     RetrievalState,
     DEFAULT_EVIDENCE_LOG,
     DEFAULT_LOCK_LOG,
+    DEFAULT_GENERATION_LOG,
 )
 from session_utils import load_session, parse_option_id, purge_expired_pending, save_session
 
@@ -290,6 +296,9 @@ def _build_output_from_state(
     state: RetrievalState,
     *,
     include_candidates: bool = False,
+    session_id: Optional[str] = None,
+    turn: Optional[int] = None,
+    generation_log_path: Optional[Path] = None,
 ) -> Dict:
     parents = state.parents
     parent_lock = state.parent_lock
@@ -298,7 +307,86 @@ def _build_output_from_state(
     if parent_lock.status == "locked" and parents:
         sufficient, missing = evidence_sufficient(evidence_set)
         if sufficient:
+            start_ts = time.time()
             answer = format_auto_answer(evidence_set)
+            output_intent = "full_recipe"
+            evidence_chunks = evidence_set.get("chunks", []) if evidence_set else []
+            block_types = sorted(
+                {normalize_block_type(c.get("block_type")) for c in evidence_chunks if c.get("block_type")}
+            )
+            if generation_log_path:
+                log_generation_started(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": turn,
+                        "mode": "single_turn",
+                        "query": query,
+                        "output_intent": output_intent,
+                        "decision": {
+                            "state": "AUTO_RECOMMEND",
+                            "layer_used": 2,
+                            "intent": "FULL_RECIPE",
+                            "intent_conf": None,
+                            "upgraded_to_layer2": True,
+                            "upgrade_reason": None,
+                        },
+                        "lock": {
+                            "status": "locked",
+                            "parent_id": parent_lock.parent_id,
+                            "lock_reason": parent_lock.lock_reason,
+                            "lock_score": parent_lock.lock_score,
+                            "locked_at_turn": parent_lock.locked_at_turn,
+                        },
+                        "evidence": {
+                            "parent_id": parent_lock.parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                            "block_types": block_types,
+                            "size": len(evidence_chunks),
+                        },
+                        "scoring": {
+                            "top1_overall_score": parents[0].overall_score if parents else None,
+                            "top2_overall_score": parents[1].overall_score if len(parents) > 1 else None,
+                            "ratio12": (parents[1].overall_score / parents[0].overall_score)
+                            if len(parents) > 1 and parents[0].overall_score > 0
+                            else None,
+                        },
+                    },
+                    log_path=generation_log_path,
+                )
+                mapping = build_generation_mapping(output_intent, evidence_set)
+                log_generation_mapping(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": turn,
+                        "mapping_strategy": "by_block_type_v1",
+                        "sections": mapping,
+                    },
+                    log_path=generation_log_path,
+                )
+                log_generation_completed(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": turn,
+                        "status": "ok",
+                        "finish_reason": "ok",
+                        "latency_ms": int((time.time() - start_ts) * 1000),
+                        "output": {
+                            "format": "markdown",
+                            "sections": [m["section"] for m in mapping],
+                            "char_count": len(answer),
+                            "preview": answer[:200],
+                        },
+                        "evidence": {
+                            "parent_id": parent_lock.parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                        },
+                        "error": {"type": None, "message": None},
+                    },
+                    log_path=generation_log_path,
+                )
             return {
                 "trace_id": trace_id,
                 "state": "AUTO_RECOMMEND",
@@ -306,6 +394,30 @@ def _build_output_from_state(
                 "lock_status": "locked",
                 "answer": answer,
             }
+        if generation_log_path:
+            evidence_chunks = evidence_set.get("chunks", []) if evidence_set else []
+            log_generation_completed(
+                {
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "turn": turn,
+                    "status": "refused",
+                    "finish_reason": "evidence_insufficient",
+                    "latency_ms": 0,
+                    "output": {
+                        "format": "markdown",
+                        "sections": [],
+                        "char_count": 0,
+                        "preview": "",
+                    },
+                    "evidence": {
+                        "parent_id": parent_lock.parent_id,
+                        "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                    },
+                    "error": {"type": None, "message": None},
+                },
+                log_path=generation_log_path,
+            )
         return {
             "trace_id": trace_id,
             "state": "LOW_EVIDENCE",
@@ -368,7 +480,15 @@ def run_once(
         evidence_insufficient=evidence_insufficient,
         turn=turn,
     )
-    return _build_output_from_state(query, trace_id, state, include_candidates=False)
+    return _build_output_from_state(
+        query,
+        trace_id,
+        state,
+        include_candidates=False,
+        session_id=None,
+        turn=turn,
+        generation_log_path=DEFAULT_GENERATION_LOG,
+    )
 
 
 def run_session_once(
@@ -436,19 +556,121 @@ def run_session_once(
                 "parent_id": parent_id,
                 "pending_reason": None,
                 "lock_score": lock_score,
+                "lock_reason": "user_select",
             }
             session["pending_candidates"] = []
             session["last_trace_id"] = trace_id
             session["updated_at"] = now
             save_session(session)
             if sufficient:
+                start_ts = time.time()
+                evidence_chunks = evidence_set.get("chunks", []) if evidence_set else []
+                block_types = sorted(
+                    {normalize_block_type(c.get("block_type")) for c in evidence_chunks if c.get("block_type")}
+                )
+                output_intent = "full_recipe"
+                log_generation_started(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "mode": "session_followup",
+                        "query": query,
+                        "output_intent": output_intent,
+                        "decision": {
+                            "state": "AUTO_RECOMMEND",
+                            "layer_used": 2,
+                            "intent": "FULL_RECIPE",
+                            "intent_conf": None,
+                            "upgraded_to_layer2": False,
+                            "upgrade_reason": None,
+                        },
+                        "lock": {
+                            "status": "locked",
+                            "parent_id": parent_id,
+                            "lock_reason": "user_select",
+                            "lock_score": lock_score,
+                            "locked_at_turn": current_turn,
+                        },
+                        "evidence": {
+                            "parent_id": parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                            "block_types": block_types,
+                            "size": len(evidence_chunks),
+                        },
+                        "scoring": {
+                            "top1_overall_score": lock_score,
+                            "top2_overall_score": None,
+                            "ratio12": None,
+                        },
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
+                mapping = build_generation_mapping(output_intent, evidence_set)
+                log_generation_mapping(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "mapping_strategy": "by_block_type_v1",
+                        "sections": mapping,
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
+                answer = format_auto_answer(evidence_set)
+                log_generation_completed(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "status": "ok",
+                        "finish_reason": "ok",
+                        "latency_ms": int((time.time() - start_ts) * 1000),
+                        "output": {
+                            "format": "markdown",
+                            "sections": [m["section"] for m in mapping],
+                            "char_count": len(answer),
+                            "preview": answer[:200],
+                        },
+                        "evidence": {
+                            "parent_id": parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                        },
+                        "error": {"type": None, "message": None},
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
                 return {
                     "trace_id": trace_id,
                     "state": "AUTO_RECOMMEND",
                     "parent_id": parent_id,
                     "lock_status": "locked",
-                    "answer": format_auto_answer(evidence_set),
+                    "answer": answer,
                 }
+            log_generation_completed(
+                {
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "turn": current_turn,
+                    "status": "refused",
+                    "finish_reason": "evidence_insufficient",
+                    "latency_ms": 0,
+                    "output": {
+                        "format": "markdown",
+                        "sections": [],
+                        "char_count": 0,
+                        "preview": "",
+                    },
+                    "evidence": {
+                        "parent_id": parent_id,
+                        "chunk_ids": [
+                            c.get("chunk_id") for c in evidence_set.get("chunks", []) if c.get("chunk_id")
+                        ],
+                    },
+                    "error": {"type": None, "message": None},
+                },
+                log_path=DEFAULT_GENERATION_LOG,
+            )
             return {
                 "trace_id": trace_id,
                 "state": "LOW_EVIDENCE",
@@ -555,6 +777,83 @@ def run_session_once(
 
             sufficient, missing = evidence_sufficient(evidence_set)
             if answer and sufficient:
+                start_ts = time.time()
+                output_intent = output_intent_for(intent, slots)
+                final_evidence = evidence_set if routing_log["upgraded_to_layer2"] else evidence_layer1
+                evidence_chunks = final_evidence.get("chunks", []) if final_evidence else []
+                block_types = sorted(
+                    {normalize_block_type(c.get("block_type")) for c in evidence_chunks if c.get("block_type")}
+                )
+                log_generation_started(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "mode": "session_followup",
+                        "query": query,
+                        "output_intent": output_intent,
+                        "decision": {
+                            "state": "AUTO_RECOMMEND",
+                            "layer_used": 2 if routing_log["upgraded_to_layer2"] else 1,
+                            "intent": intent,
+                            "intent_conf": confidence,
+                            "upgraded_to_layer2": routing_log["upgraded_to_layer2"],
+                            "upgrade_reason": routing_log["upgrade_reason"],
+                        },
+                        "lock": {
+                            "status": "locked",
+                            "parent_id": parent_id,
+                            "lock_reason": session.get("parent_lock", {}).get("lock_reason"),
+                            "lock_score": session.get("parent_lock", {}).get("lock_score"),
+                            "locked_at_turn": current_turn,
+                        },
+                        "evidence": {
+                            "parent_id": parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                            "block_types": block_types,
+                            "size": len(evidence_chunks),
+                        },
+                        "scoring": {
+                            "top1_overall_score": session.get("parent_lock", {}).get("lock_score"),
+                            "top2_overall_score": None,
+                            "ratio12": None,
+                        },
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
+                mapping = build_generation_mapping(output_intent, final_evidence)
+                log_generation_mapping(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "mapping_strategy": "by_block_type_v1",
+                        "sections": mapping,
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
+                log_generation_completed(
+                    {
+                        "trace_id": trace_id,
+                        "session_id": session_id,
+                        "turn": current_turn,
+                        "status": "ok",
+                        "finish_reason": "ok",
+                        "latency_ms": int((time.time() - start_ts) * 1000),
+                        "output": {
+                            "format": "markdown",
+                            "sections": [m["section"] for m in mapping],
+                            "char_count": len(answer),
+                            "preview": answer[:200],
+                        },
+                        "evidence": {
+                            "parent_id": parent_id,
+                            "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
+                        },
+                        "error": {"type": None, "message": None},
+                    },
+                    log_path=DEFAULT_GENERATION_LOG,
+                )
                 session["last_trace_id"] = trace_id
                 session["updated_at"] = now
                 save_session(session)
@@ -589,6 +888,30 @@ def run_session_once(
                     },
                     log_path=evidence_log_path,
                 )
+            log_generation_completed(
+                {
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "turn": current_turn,
+                    "status": "refused",
+                    "finish_reason": "evidence_insufficient",
+                    "latency_ms": 0,
+                    "output": {
+                        "format": "markdown",
+                        "sections": [],
+                        "char_count": 0,
+                        "preview": "",
+                    },
+                    "evidence": {
+                        "parent_id": parent_id,
+                        "chunk_ids": [
+                            c.get("chunk_id") for c in evidence_set.get("chunks", []) if c.get("chunk_id")
+                        ],
+                    },
+                    "error": {"type": None, "message": None},
+                },
+                log_path=DEFAULT_GENERATION_LOG,
+            )
             return {
                 "trace_id": trace_id,
                 "state": "LOW_EVIDENCE",
@@ -628,6 +951,7 @@ def run_session_once(
             "parent_id": None,
             "pending_reason": "ambiguous_top1_top2",
             "lock_score": top1_score,
+            "lock_reason": None,
         }
         session["pending_candidates"] = pending_candidates
         session["parent_cache"] = None
@@ -637,6 +961,7 @@ def run_session_once(
             "parent_id": state.parent_lock.parent_id,
             "pending_reason": state.parent_lock.pending_reason,
             "lock_score": state.parent_lock.lock_score,
+            "lock_reason": state.parent_lock.lock_reason,
         }
         session["pending_candidates"] = []
         if state.parent_lock.status != "locked":

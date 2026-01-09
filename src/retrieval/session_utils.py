@@ -21,7 +21,13 @@ def load_session(session_id: str) -> Dict:
             "session_id": session_id,
             "turn": 0,
             "last_trace_id": None,
-            "parent_lock": {"status": "none", "parent_id": None, "pending_reason": None, "lock_score": None},
+            "parent_lock": {
+                "status": "none",
+                "parent_id": None,
+                "pending_reason": None,
+                "lock_score": None,
+                "lock_reason": None,
+            },
             "pending_candidates": [],
             "parent_cache": None,
             "ttl_seconds": 900,
@@ -44,7 +50,13 @@ def purge_expired_pending(session: Dict) -> None:
     if session.get("parent_lock", {}).get("status") != "pending":
         return
     if (time.time() - updated_at) > ttl_seconds:
-        session["parent_lock"] = {"status": "none", "parent_id": None, "pending_reason": None, "lock_score": None}
+        session["parent_lock"] = {
+            "status": "none",
+            "parent_id": None,
+            "pending_reason": None,
+            "lock_score": None,
+            "lock_reason": None,
+        }
         session["pending_candidates"] = []
 
 
