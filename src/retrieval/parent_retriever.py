@@ -85,6 +85,13 @@ def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Pat
         )
     parent_candidates = []
     for ph in parents:
+        flags = []
+        if ph.low_evidence:
+            flags.append("LOW_EVIDENCE")
+        if ph.good_but_ambiguous:
+            flags.append("GOOD_BUT_AMBIGUOUS")
+        if ph.auto_recommend:
+            flags.append("AUTO_RECOMMEND")
         parent_candidates.append(
             {
                 "parent_id": ph.parent_id,
@@ -93,6 +100,11 @@ def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Pat
                 "coverage_score": ph.coverage_ratio,
                 "coverage_raw": ph.coverage,
                 "total_chunks": ph.total_chunks,
+                "max_chunk_score": ph.max_chunk_score,
+                "rrf_sum_norm": ph.rrf_sum_norm,
+                "max_chunk_norm": ph.max_chunk_norm,
+                "overall_score": ph.overall_score,
+                "flags": flags,
                 "hit_block_types": sorted({h.metadata.get("category") for h in ph.hits if h.metadata.get("category")}),
                 "top_evidence_snippets": [h.text.replace("\n", " ")[:80] for h in ph.hits[:3]],
             }
@@ -130,6 +142,12 @@ class ParentHit:
     coverage: int = 0  # hit count
     total_chunks: int = 0
     coverage_ratio: float = 0.0
+    rrf_sum_norm: float = 0.0
+    max_chunk_norm: float = 0.0
+    overall_score: float = 0.0
+    low_evidence: bool = False
+    good_but_ambiguous: bool = False
+    auto_recommend: bool = False
     hits: List[ChunkHit] = field(default_factory=list)
     parent_doc: Optional[str] = None
 
@@ -177,18 +195,37 @@ def aggregate_hits(
     for ph in parents.values():
         ph.hits.sort(key=lambda h: h.score, reverse=True)
 
-    # Compute coverage ratio and sort parents by (rrf_sum + coverage_ratio) then max_chunk_score.
+    # Compute coverage ratio.
     for ph in parents.values():
         if ph.total_chunks > 0:
             ph.coverage_ratio = ph.coverage / ph.total_chunks
         else:
             ph.coverage_ratio = 0.0
 
-    return sorted(
-        parents.values(),
-        key=lambda p: (p.rrf_sum + p.coverage_ratio, p.max_chunk_score),
-        reverse=True,
-    )
+    # Normalize rrf_sum and max_chunk_score for parents that pass coverage threshold.
+    coverage_threshold = 0.5
+    eps = 1e-8
+    eligible = [ph for ph in parents.values() if ph.coverage_ratio >= coverage_threshold]
+    if eligible:
+        min_rrf = min(p.rrf_sum for p in eligible)
+        max_rrf = max(p.rrf_sum for p in eligible)
+        min_max = min(p.max_chunk_score for p in eligible)
+        max_max = max(p.max_chunk_score for p in eligible)
+        w1 = 0.8
+        w2 = 0.2
+        for ph in eligible:
+            ph.rrf_sum_norm = (ph.rrf_sum - min_rrf) / (max_rrf - min_rrf + eps)
+            ph.max_chunk_norm = (ph.max_chunk_score - min_max) / (max_max - min_max + eps)
+            ph.overall_score = w1 * ph.rrf_sum_norm + w2 * ph.max_chunk_norm
+
+        # Sort only eligible parents by overall_score desc.
+        return sorted(
+            eligible,
+            key=lambda p: p.overall_score,
+            reverse=True,
+        )
+
+    return list(parents.values())
 
 
 def load_parent_doc(parent_id: str) -> Optional[str]:
@@ -223,11 +260,33 @@ def retrieve(
 
     res = collection.query(query_texts=[query], n_results=top_k)
     parents = aggregate_hits(res)
+    coverage_threshold = 0.5
+    any_eligible = any(ph.coverage_ratio >= coverage_threshold for ph in parents)
+    t_min = 0.40
+    auto_recommend = True
+    if not any_eligible:
+        for ph in parents:
+            ph.low_evidence = True
+        auto_recommend = False
+    if parents and parents[0].overall_score < t_min:
+        for ph in parents:
+            ph.low_evidence = True
+        auto_recommend = False
+    if parents and parents[0].overall_score > t_min and len(parents) > 1:
+        score1 = parents[0].overall_score
+        score2 = parents[1].overall_score
+        if score1 > 0 and (score2 / score1) > 0.92:
+            for ph in parents:
+                ph.good_but_ambiguous = True
+            auto_recommend = False
+    if auto_recommend:
+        for ph in parents:
+            ph.auto_recommend = True
     for ph in parents[:top_parents]:
         ph.parent_doc = load_parent_doc(ph.parent_id)
 
     if log_path:
-        log_retrieval(query, res, parents)
+        log_retrieval(query, res, parents[:top_parents])
     return parents[:top_parents]
 
 
