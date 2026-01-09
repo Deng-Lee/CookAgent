@@ -18,263 +18,45 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import os
-from dataclasses import dataclass, field
-import datetime
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-LOCAL_MODEL_ENV = "LOCAL_BGE_M3_PATH"
-DEFAULT_LOCK_LOG = Path("logs/parent_locking.log")
-DEFAULT_EVIDENCE_LOG = Path("logs/evidence_driven.log")
+from evidence_utils import (
+    build_evidence_set,
+    build_evidence_set_for_parent,
+    default_clarify_question,
+    evidence_sufficient,
+    extract_first_step,
+    format_auto_answer,
+)
+from logging_utils import (
+    log_evidence_built,
+    log_evidence_insufficient,
+    log_parent_lock,
+    log_retrieval,
+)
+from model_utils import resolve_local_model_path
+from retrieval_types import (
+    ChunkHit,
+    ParentHit,
+    ParentLock,
+    RetrievalState,
+    DEFAULT_EVIDENCE_LOG,
+    DEFAULT_LOCK_LOG,
+)
+from session_utils import load_session, parse_option_id, purge_expired_pending, save_session
 
 
-def resolve_local_model_path() -> str:
-    """
-    Resolve local path to BAAI/bge-m3 snapshot to avoid network calls.
-    Priority:
-    1) Env LOCAL_BGE_M3_PATH if set and exists.
-    2) Latest snapshot under ~/.cache/huggingface/hub/models--BAAI--bge-m3/snapshots/<hash> that contains config.json
-    3) Fallback to ~/.cache/huggingface/hub/models--BAAI--bge-m3 if it contains config.json
-    """
-    env_path = os.environ.get(LOCAL_MODEL_ENV)
-    if env_path:
-        p = Path(env_path).expanduser()
-        if p.exists():
-            return str(p)
-    root = Path.home() / ".cache" / "huggingface" / "hub" / "models--BAAI--bge-m3"
-    snapshots_root = root / "snapshots"
-    if snapshots_root.exists():
-        snapshots = sorted(
-            [p for p in snapshots_root.glob("*") if (p / "config.json").exists()],
-            key=lambda x: x.stat().st_mtime,
-            reverse=True,
-        )
-        if snapshots:
-            return str(snapshots[0])
-    if root.exists() and (root / "config.json").exists():
-        return str(root)
-    raise FileNotFoundError(
-        f"Local BGE model not found. Set {LOCAL_MODEL_ENV} to the model directory or ensure HF cache exists."
-    )
-
-
-def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Path = Path("logs/retriever.log")) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    ids = res["ids"][0]
-    documents = res["documents"][0]
-    metadatas = res["metadatas"][0]
-    distances = res["distances"][0]
-    vector_topk = []
-    seen_chunk_ids = set()
-    for idx, (hit_id, doc, meta, dist) in enumerate(zip(ids, documents, metadatas, distances), start=1):
-        if hit_id in seen_chunk_ids:
-            continue
-        seen_chunk_ids.add(hit_id)
-        vector_topk.append(
-            {
-                "chunk_id": hit_id,
-                "parent_id": meta.get("parent_id"),
-                "block_type": meta.get("category"),
-                "rank": idx,
-                "score": _distance_to_score(dist),
-                "snippet_80": doc.replace("\n", " ")[:80],
-            }
-        )
-    parent_candidates = []
-    for ph in parents:
-        flags = []
-        if ph.low_evidence:
-            flags.append("LOW_EVIDENCE")
-        if ph.good_but_ambiguous:
-            flags.append("GOOD_BUT_AMBIGUOUS")
-        if ph.auto_recommend:
-            flags.append("AUTO_RECOMMEND")
-        parent_candidates.append(
-            {
-                "parent_id": ph.parent_id,
-                "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
-                "rrf_sum_score": ph.rrf_sum,
-                "coverage_score": ph.coverage_ratio,
-                "coverage_raw": ph.coverage,
-                "total_chunks": ph.total_chunks,
-                "max_chunk_score": ph.max_chunk_score,
-                "rrf_sum_norm": ph.rrf_sum_norm,
-                "max_chunk_norm": ph.max_chunk_norm,
-                "overall_score": ph.overall_score,
-                "flags": flags,
-                "hit_block_types": sorted({h.metadata.get("category") for h in ph.hits if h.metadata.get("category")}),
-                "top_evidence_snippets": [h.text.replace("\n", " ")[:80] for h in ph.hits[:3]],
-            }
-        )
-    record = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "span_name": "retriever_vector",
-        "query": query,
-        "topk": len(vector_topk),
-        "vector_topk": vector_topk,
-        "parent_candidates": parent_candidates,
-    }
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def log_parent_lock(
-    query: str,
-    parent_lock: ParentLock,
-    parents: List[ParentHit],
-    log_path: Path = DEFAULT_LOCK_LOG,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    if parent_lock.status == "pending":
-        candidates = [
-            {
-                "parent_id": ph.parent_id,
-                "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
-                "overall_score": ph.overall_score,
-                "top_evidence_snippets": [h.text.replace("\n", " ")[:80] for h in ph.hits[:3]],
-            }
-            for ph in parents
-        ]
-    else:
-        candidates = []
-    record = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "span_name": "parent_lock",
-        "query": query,
-        "event": "lock_created"
-        if parent_lock.status == "locked"
-        else "lock_pending"
-        if parent_lock.status == "pending"
-        else "lock_none",
-        "parent_lock": {
-            "status": parent_lock.status,
-            "parent_id": parent_lock.parent_id,
-            "lock_reason": parent_lock.lock_reason,
-            "lock_score": parent_lock.lock_score,
-            "locked_at_turn": parent_lock.locked_at_turn,
-            "pending_reason": parent_lock.pending_reason,
-        },
-        "candidates": candidates,
-    }
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def build_evidence_set(parent: ParentHit) -> Dict:
-    seen_chunk_ids = set()
-    chunks = []
-    for hit in parent.hits:
-        chunk_id = hit.metadata.get("chunk_id")
-        if not chunk_id or chunk_id in seen_chunk_ids:
-            continue
-        seen_chunk_ids.add(chunk_id)
-        chunks.append(
-            {
-                "chunk_id": chunk_id,
-                "block_type": hit.metadata.get("category"),
-                "text": hit.text,
-                "score": hit.score,
-            }
-        )
-    return {
-        "parent_id": parent.parent_id,
-        "chunks": chunks,
-    }
-
-
-def log_evidence_event(
-    query: str,
-    evidence_set: Dict,
-    log_path: Path = DEFAULT_EVIDENCE_LOG,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    chunk_ids = [c.get("chunk_id") for c in evidence_set.get("chunks", [])]
-    record = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "span_name": "evidence_built",
-        "query": query,
-        "evidence_set": {
-            "parent_id": evidence_set.get("parent_id"),
-            "chunk_ids": chunk_ids,
-        },
-    }
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
-def log_evidence_insufficient(
-    query: str,
-    turn: Optional[int],
-    parent_lock: ParentLock,
-    evidence_set: Dict,
-    payload: Dict,
-    log_path: Path = DEFAULT_EVIDENCE_LOG,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_chunks = evidence_set.get("chunks", [])
-    record = {
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "event": "evidence_insufficient",
-        "turn": turn,
-        "query": query,
-        "locked_parent_id": parent_lock.parent_id,
-        "output_intent": payload.get("output_intent"),
-        "evidence_chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
-        "evidence_block_types": [
-            c.get("block_type") for c in evidence_chunks if c.get("block_type") is not None
-        ],
-        "missing_block_types": payload.get("missing_block_types", []),
-        "missing_slots": payload.get("missing_slots", []),
-        "decision": payload.get("decision"),
-    }
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _distance_to_score(distance: float) -> float:
     """Convert Chroma distance (cosine) to a similarity score."""
     return 1.0 / (1.0 + distance)
-
-
-@dataclass
-class ChunkHit:
-    score: float
-    rank: int
-    text: str
-    metadata: Dict
-
-
-@dataclass
-class ParentHit:
-    parent_id: str
-    rrf_sum: float = 0.0
-    max_chunk_score: float = 0.0
-    coverage: int = 0  # hit count
-    total_chunks: int = 0
-    coverage_ratio: float = 0.0
-    rrf_sum_norm: float = 0.0
-    max_chunk_norm: float = 0.0
-    overall_score: float = 0.0
-    low_evidence: bool = False
-    good_but_ambiguous: bool = False
-    auto_recommend: bool = False
-    hits: List[ChunkHit] = field(default_factory=list)
-    parent_doc: Optional[str] = None
-
-
-@dataclass
-class ParentLock:
-    status: str  # locked | pending | none
-    parent_id: Optional[str]
-    lock_reason: Optional[str]
-    lock_score: Optional[float]
-    locked_at_turn: Optional[int]
-    pending_reason: Optional[str]
 
 
 def aggregate_hits(
@@ -363,7 +145,7 @@ def load_parent_doc(parent_id: str) -> Optional[str]:
     return None
 
 
-def retrieve(
+def _retrieve_state(
     query: str,
     db_path: Path,
     collection_name: str,
@@ -375,7 +157,7 @@ def retrieve(
     evidence_log_path: Optional[Path] = None,
     evidence_insufficient: Optional[Dict] = None,
     turn: Optional[int] = None,
-) -> List[ParentHit]:
+) -> RetrievalState:
     model_path = resolve_local_model_path()
     embedding_fn = SentenceTransformerEmbeddingFunction(
         model_name=model_path,
@@ -435,7 +217,7 @@ def retrieve(
             lock_reason=None,
             lock_score=None,
             locked_at_turn=turn,
-            pending_reason="GOOD_BUT_AMBIGUOUS",
+            pending_reason="ambiguous_top1_top2",
         )
     for ph in parents[:top_parents]:
         ph.parent_doc = load_parent_doc(ph.parent_id)
@@ -448,7 +230,7 @@ def retrieve(
     if parent_lock.status == "locked" and parents:
         evidence_set = build_evidence_set(parents[0])
         if evidence_log_path:
-            log_evidence_event(query, evidence_set, log_path=evidence_log_path)
+            log_evidence_built(query, evidence_set, log_path=evidence_log_path)
     if evidence_insufficient and parent_lock.status == "locked" and evidence_set:
         log_evidence_insufficient(
             query,
@@ -458,7 +240,282 @@ def retrieve(
             evidence_insufficient,
             log_path=evidence_log_path or DEFAULT_EVIDENCE_LOG,
         )
-    return parents[:top_parents]
+    return RetrievalState(
+        parents=parents[:top_parents],
+        parent_lock=parent_lock,
+        evidence_set=evidence_set,
+    )
+
+
+def retrieve(
+    query: str,
+    db_path: Path,
+    collection_name: str,
+    *,
+    top_k: int = 25,
+    top_parents: int = 5,
+    log_path: Optional[Path] = None,
+    lock_log_path: Optional[Path] = None,
+    evidence_log_path: Optional[Path] = None,
+    evidence_insufficient: Optional[Dict] = None,
+    turn: Optional[int] = None,
+) -> List[ParentHit]:
+    state = _retrieve_state(
+        query=query,
+        db_path=db_path,
+        collection_name=collection_name,
+        top_k=top_k,
+        top_parents=top_parents,
+        log_path=log_path,
+        lock_log_path=lock_log_path,
+        evidence_log_path=evidence_log_path,
+        evidence_insufficient=evidence_insufficient,
+        turn=turn,
+    )
+    return state.parents
+
+
+def _build_output_from_state(
+    query: str,
+    trace_id: str,
+    state: RetrievalState,
+    *,
+    include_candidates: bool = False,
+) -> Dict:
+    parents = state.parents
+    parent_lock = state.parent_lock
+    evidence_set = state.evidence_set
+
+    if parent_lock.status == "locked" and parents:
+        sufficient, missing = evidence_sufficient(evidence_set)
+        if sufficient:
+            answer = format_auto_answer(evidence_set)
+            return {
+                "trace_id": trace_id,
+                "state": "AUTO_RECOMMEND",
+                "parent_id": parent_lock.parent_id,
+                "lock_status": "locked",
+                "answer": answer,
+            }
+        return {
+            "trace_id": trace_id,
+            "state": "LOW_EVIDENCE",
+            "lock_status": "none",
+            "message": "evidence_insufficient",
+            "missing_block_types": missing,
+            "clarify_question": default_clarify_question(query),
+        }
+
+    if parent_lock.status == "pending":
+        candidates = []
+        for idx, ph in enumerate(parents, 1):
+            item = {
+                "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
+                "overall_score": ph.overall_score,
+                "top_evidence_snippets": [h.text.replace("\n", " ")[:80] for h in ph.hits[:3]],
+            }
+            if include_candidates:
+                item["option_id"] = str(idx)
+            candidates.append(item)
+        return {
+            "trace_id": trace_id,
+            "state": "GOOD_BUT_AMBIGUOUS",
+            "lock_status": "pending",
+            "candidates": candidates,
+        }
+
+    return {
+        "trace_id": trace_id,
+        "state": "LOW_EVIDENCE",
+        "lock_status": "none",
+        "message": "evidence_too_low_or_no_candidates",
+        "clarify_question": default_clarify_question(query),
+    }
+
+
+def run_once(
+    query: str,
+    trace_id: str,
+    *,
+    db_path: Path,
+    collection_name: str,
+    top_k: int = 25,
+    top_parents: int = 5,
+    log_path: Optional[Path] = None,
+    lock_log_path: Optional[Path] = None,
+    evidence_log_path: Optional[Path] = None,
+    evidence_insufficient: Optional[Dict] = None,
+    turn: Optional[int] = None,
+) -> Dict:
+    state = _retrieve_state(
+        query=query,
+        db_path=db_path,
+        collection_name=collection_name,
+        top_k=top_k,
+        top_parents=top_parents,
+        log_path=log_path,
+        lock_log_path=lock_log_path,
+        evidence_log_path=evidence_log_path,
+        evidence_insufficient=evidence_insufficient,
+        turn=turn,
+    )
+    return _build_output_from_state(query, trace_id, state, include_candidates=False)
+
+
+def run_session_once(
+    query: str,
+    trace_id: str,
+    session_id: str,
+    *,
+    db_path: Path,
+    collection_name: str,
+    top_k: int = 25,
+    top_parents: int = 5,
+    log_path: Optional[Path] = None,
+    lock_log_path: Optional[Path] = None,
+    evidence_log_path: Optional[Path] = None,
+    evidence_insufficient: Optional[Dict] = None,
+    turn: Optional[int] = None,
+) -> Dict:
+    session = load_session(session_id)
+    now = time.time()
+    last_turn = session.get("turn") or 0
+    current_turn = turn if turn is not None else last_turn + 1
+    session["turn"] = current_turn
+
+    purge_expired_pending(session)
+
+    option_id = parse_option_id(query, session.get("pending_candidates", []))
+    if option_id:
+        candidate = next(
+            (c for c in session.get("pending_candidates", []) if c.get("option_id") == option_id), None
+        )
+        if candidate:
+            parent_id = candidate.get("parent_id")
+            lock_score = candidate.get("overall_score")
+            parent_lock = ParentLock(
+                status="locked",
+                parent_id=parent_id,
+                lock_reason="user_select",
+                lock_score=lock_score,
+                locked_at_turn=current_turn,
+                pending_reason=None,
+            )
+            evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
+            if evidence_log_path:
+                log_evidence_built(query, evidence_set, log_path=evidence_log_path)
+            sufficient, missing = evidence_sufficient(evidence_set)
+            if lock_log_path:
+                log_parent_lock(query, parent_lock, [], log_path=lock_log_path)
+            session["parent_lock"] = {
+                "status": "locked",
+                "parent_id": parent_id,
+                "pending_reason": None,
+                "lock_score": lock_score,
+            }
+            session["pending_candidates"] = []
+            session["last_trace_id"] = trace_id
+            session["updated_at"] = now
+            save_session(session)
+            if sufficient:
+                return {
+                    "trace_id": trace_id,
+                    "state": "AUTO_RECOMMEND",
+                    "parent_id": parent_id,
+                    "lock_status": "locked",
+                    "answer": format_auto_answer(evidence_set),
+                }
+            return {
+                "trace_id": trace_id,
+                "state": "LOW_EVIDENCE",
+                "lock_status": "none",
+                "message": "evidence_insufficient",
+                "missing_block_types": missing,
+                "clarify_question": default_clarify_question(query),
+            }
+
+    if session.get("parent_lock", {}).get("status") == "locked":
+        parent_id = session.get("parent_lock", {}).get("parent_id")
+        if parent_id:
+            evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
+            if evidence_log_path:
+                log_evidence_built(query, evidence_set, log_path=evidence_log_path)
+            sufficient, missing = evidence_sufficient(evidence_set)
+            if sufficient:
+                if "第一步" in query or "第1步" in query:
+                    first_step = extract_first_step(evidence_set)
+                    if first_step:
+                        answer = f"第一步：{first_step}"
+                    else:
+                        answer = format_auto_answer(evidence_set)
+                else:
+                    answer = format_auto_answer(evidence_set)
+                session["last_trace_id"] = trace_id
+                session["updated_at"] = now
+                save_session(session)
+                return {
+                    "trace_id": trace_id,
+                    "state": "AUTO_RECOMMEND",
+                    "parent_id": parent_id,
+                    "lock_status": "locked",
+                    "answer": answer,
+                }
+            session["last_trace_id"] = trace_id
+            session["updated_at"] = now
+            save_session(session)
+            return {
+                "trace_id": trace_id,
+                "state": "LOW_EVIDENCE",
+                "lock_status": "locked",
+                "message": "evidence_insufficient",
+                "missing_block_types": missing,
+                "clarify_question": "该菜谱未提及这一点，是否需要切换做法？",
+            }
+
+    state = _retrieve_state(
+        query=query,
+        db_path=db_path,
+        collection_name=collection_name,
+        top_k=top_k,
+        top_parents=top_parents,
+        log_path=log_path,
+        lock_log_path=lock_log_path,
+        evidence_log_path=evidence_log_path,
+        evidence_insufficient=evidence_insufficient,
+        turn=current_turn,
+    )
+    output = _build_output_from_state(query, trace_id, state, include_candidates=True)
+    if output.get("state") == "GOOD_BUT_AMBIGUOUS":
+        pending_candidates = []
+        for idx, ph in enumerate(state.parents, 1):
+            pending_candidates.append(
+                {
+                    "option_id": str(idx),
+                    "parent_id": ph.parent_id,
+                    "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
+                    "overall_score": ph.overall_score,
+                }
+            )
+        top1_score = state.parents[0].overall_score if state.parents else None
+        session["parent_lock"] = {
+            "status": "pending",
+            "parent_id": None,
+            "pending_reason": "ambiguous_top1_top2",
+            "lock_score": top1_score,
+        }
+        session["pending_candidates"] = pending_candidates
+    else:
+        session["parent_lock"] = {
+            "status": state.parent_lock.status,
+            "parent_id": state.parent_lock.parent_id,
+            "pending_reason": state.parent_lock.pending_reason,
+            "lock_score": state.parent_lock.lock_score,
+        }
+        session["pending_candidates"] = []
+    session["last_trace_id"] = trace_id
+    session["updated_at"] = now
+    save_session(session)
+    return output
 
 
 def parse_args() -> argparse.Namespace:
@@ -487,42 +544,60 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Conversation turn index for parent locking logs.",
     )
+    parser.add_argument(
+        "--trace-id",
+        type=str,
+        default="cli",
+        help="Trace id for run_once output.",
+    )
+    parser.add_argument(
+        "--session-id",
+        type=str,
+        default="cli_default",
+        help="Session id for minimal persistence.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    query = args.query or input("请输入问题: ").strip()
-    if not query:
-        print("未输入问题，退出。")
-        return
-    parents = retrieve(
-        query=query,
-        db_path=args.db_path,
-        collection_name=args.collection,
-        top_k=args.top_k,
-        top_parents=args.top_parents,
-        log_path=args.log_path,
-        lock_log_path=args.lock_log_path,
-        evidence_log_path=args.evidence_log_path,
-        turn=args.turn,
-    )
-    for i, ph in enumerate(parents, 1):
-        print(
-            f"[parent {i}] id={ph.parent_id} "
-            f"rrf_sum={ph.rrf_sum:.4f} max_score={ph.max_chunk_score:.4f} "
-            f"coverage={ph.coverage} total_chunks={ph.total_chunks} coverage_ratio={ph.coverage_ratio:.4f}"
+    if args.query:
+        result = run_session_once(
+            query=args.query.strip(),
+            trace_id=args.trace_id,
+            session_id=args.session_id,
+            db_path=args.db_path,
+            collection_name=args.collection,
+            top_k=args.top_k,
+            top_parents=args.top_parents,
+            log_path=args.log_path,
+            lock_log_path=args.lock_log_path,
+            evidence_log_path=args.evidence_log_path,
+            turn=args.turn,
         )
-        print(" top chunks:")
-        for hit in ph.hits[:3]:
-            cat = hit.metadata.get("category")
-            text_preview = hit.text.replace("\n", " ")[:80]
-            print(f"   - score={hit.score:.4f} rank={hit.rank} category={cat} text={text_preview}...")
-        if ph.parent_doc:
-            print(f" parent_doc_loaded: {len(ph.parent_doc)} chars")
-        else:
-            print(" parent_doc_loaded: None")
-        print()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    print("进入交互模式，输入 exit 退出。")
+    while True:
+        query = input("请输入问题: ").strip()
+        if not query or query.lower() in {"exit", "quit"}:
+            print("已退出。")
+            break
+        result = run_session_once(
+            query=query,
+            trace_id=args.trace_id,
+            session_id=args.session_id,
+            db_path=args.db_path,
+            collection_name=args.collection,
+            top_k=args.top_k,
+            top_parents=args.top_parents,
+            log_path=args.log_path,
+            lock_log_path=args.lock_log_path,
+            evidence_log_path=args.evidence_log_path,
+            turn=args.turn,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
