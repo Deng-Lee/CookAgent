@@ -674,7 +674,7 @@ def run_session_once(
             return {
                 "trace_id": trace_id,
                 "state": "LOW_EVIDENCE",
-                "lock_status": "none",
+                "lock_status": "locked",
                 "message": "evidence_insufficient",
                 "missing_block_types": missing,
                 "clarify_question": default_clarify_question(query),
