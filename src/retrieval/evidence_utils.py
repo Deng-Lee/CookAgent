@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
@@ -62,15 +62,28 @@ def build_evidence_set_for_parent(
     return {"parent_id": parent_id, "chunks": chunks}
 
 
-def evidence_sufficient(evidence_set: Optional[Dict]) -> Tuple[bool, List[str]]:
+def _normalize_required_blocks(required: Optional[Iterable[str]]) -> Set[str]:
+    if not required:
+        return {"ingredients", "operation"}
+    normalized = {normalize_block_type(block) for block in required if block}
+    return {block for block in normalized if block}
+
+
+def evidence_sufficient(
+    evidence_set: Optional[Dict],
+    *,
+    required_blocks: Optional[Iterable[str]] = None,
+) -> Tuple[bool, List[str]]:
     if not evidence_set:
-        return False, ["Ingredients", "Operation"]
+        required = _normalize_required_blocks(required_blocks)
+        missing_orig = [BLOCK_CANONICAL_TO_ORIG.get(m, m) for m in sorted(required)]
+        return False, missing_orig
     block_types = {
         normalize_block_type(c.get("block_type")) for c in evidence_set.get("chunks", []) if c.get("block_type")
     }
-    required = {"ingredients", "operation"}
+    required = _normalize_required_blocks(required_blocks)
     missing = sorted(required - block_types)
-    missing_orig = [BLOCK_CANONICAL_TO_ORIG[m] for m in missing]
+    missing_orig = [BLOCK_CANONICAL_TO_ORIG.get(m, m) for m in missing]
     return not missing_orig, missing_orig
 
 

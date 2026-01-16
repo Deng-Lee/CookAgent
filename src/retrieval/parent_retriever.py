@@ -533,7 +533,11 @@ def run_session_once(
             evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
             if evidence_log_path:
                 log_evidence_built(query, evidence_set, log_path=evidence_log_path)
-            sufficient, missing = evidence_sufficient(evidence_set)
+            intent_blocks = route_blocks(intent)
+            sufficient, missing = evidence_sufficient(
+                evidence_set,
+                required_blocks=intent_blocks if intent_blocks else None,
+            )
             if lock_log_path:
                 log_parent_lock(query, parent_lock, [], log_path=lock_log_path)
             op_texts = [
