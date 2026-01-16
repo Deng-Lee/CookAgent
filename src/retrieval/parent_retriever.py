@@ -44,6 +44,15 @@ from generation_utils import (
     output_intent_for,
     build_generation_mapping,
 )
+from llm_utils import (
+    LLMCall,
+    build_extraction_payload,
+    build_polish_payload,
+    call_llm_extract,
+    call_llm_polish,
+    validate_extraction,
+    validate_polish,
+)
 from logging_utils import (
     log_evidence_built,
     log_evidence_routing,
@@ -53,6 +62,7 @@ from logging_utils import (
     log_generation_started,
     log_generation_completed,
     log_generation_mapping,
+    log_llm_call,
 )
 from model_utils import resolve_local_model_path
 from retrieval_types import (
@@ -290,6 +300,71 @@ def retrieve(
     return state.parents
 
 
+def _collect_field_texts(fields: Dict, names: List[str]) -> List[str]:
+    texts: List[str] = []
+    for name in names:
+        items = fields.get(name)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+    return texts
+
+
+def _build_recipe_from_extraction(extraction: Dict) -> Optional[str]:
+    fields = extraction.get("fields", {}) if isinstance(extraction, dict) else {}
+    if not isinstance(fields, dict):
+        return None
+    ingredients = _collect_field_texts(fields, ["ingredients"])
+    steps = _collect_field_texts(fields, ["operation", "steps"])
+    tips = _collect_field_texts(fields, ["tips"])
+    if not ingredients and not steps and not tips:
+        return None
+    sections = []
+    if ingredients:
+        sections.append("## 原料")
+        sections.append("\n".join([f"- {item}" for item in ingredients]))
+    if steps:
+        sections.append("## 步骤")
+        sections.append("\n".join([f"{idx}. {item}" for idx, item in enumerate(steps, 1)]))
+    if tips:
+        sections.append("## 注意事项")
+        sections.append("\n".join([f"- {item}" for item in tips]))
+    return "\n\n".join(sections).strip()
+
+
+def _build_recipe_from_parsed(ingredients: List[str], steps: List[str]) -> Optional[str]:
+    if not ingredients or not steps:
+        return None
+    sections = [
+        "## 原料",
+        "\n".join([f"- {item}" for item in ingredients]),
+        "## 步骤",
+        "\n".join([f"{idx}. {item}" for idx, item in enumerate(steps, 1)]),
+    ]
+    return "\n\n".join(sections).strip()
+
+
+def _build_answer_from_extraction(extraction: Dict) -> Optional[str]:
+    fields = extraction.get("fields", {}) if isinstance(extraction, dict) else {}
+    if not isinstance(fields, dict):
+        return None
+    texts: List[str] = []
+    for field_name in fields:
+        items = fields.get(field_name)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+    return "\n".join(texts).strip() if texts else None
+
+
 def _build_output_from_state(
     query: str,
     trace_id: str,
@@ -299,6 +374,9 @@ def _build_output_from_state(
     session_id: Optional[str] = None,
     turn: Optional[int] = None,
     generation_log_path: Optional[Path] = None,
+    evidence_log_path: Optional[Path] = None,
+    llm_call_extractor: Optional[LLMCall] = None,
+    llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
     parents = state.parents
     parent_lock = state.parent_lock
@@ -307,13 +385,102 @@ def _build_output_from_state(
     if parent_lock.status == "locked" and parents:
         sufficient, missing = evidence_sufficient(evidence_set)
         if sufficient:
-            start_ts = time.time()
-            answer = format_auto_answer(evidence_set)
             output_intent = "full_recipe"
             evidence_chunks = evidence_set.get("chunks", []) if evidence_set else []
             block_types = sorted(
                 {normalize_block_type(c.get("block_type")) for c in evidence_chunks if c.get("block_type")}
             )
+            answer = None
+            if llm_call_extractor:
+                payload = build_extraction_payload(evidence_set, "FULL_RECIPE", evidence_scope="full")
+                extraction = call_llm_extract(llm_call_extractor, payload)
+                ok, errors = validate_extraction(extraction, evidence_set, expected_intent="FULL_RECIPE")
+                if ok:
+                    answer = _build_recipe_from_extraction(extraction or {})
+                    if not answer:
+                        ok = False
+                        errors = ["empty_fields"]
+                log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                if log_path:
+                    fallback_reason = None
+                    if not ok:
+                        if "citation_chunk_id_invalid" in errors or "citation_quote_not_found" in errors:
+                            fallback_reason = "bad_citation"
+                        elif "number_out_of_bounds" in errors:
+                            fallback_reason = "out_of_bounds"
+                        elif "empty_fields" in errors:
+                            fallback_reason = "empty_fields"
+                        elif "intent_mismatch" in errors or "fields_missing_or_invalid" in errors:
+                            fallback_reason = "invalid_schema"
+                        else:
+                            fallback_reason = "validation_failed"
+                    log_llm_call(
+                        {
+                            "span_name": "llm_call",
+                            "trace_id": trace_id,
+                            "stage": "extract",
+                            "intent": "FULL_RECIPE",
+                            "evidence_scope": "full",
+                            "llm_called": True,
+                            "llm_success": ok,
+                            "fallback_used": not ok,
+                            "fallback_reason": fallback_reason,
+                            "fallback_target": "rule_extract" if not ok else None,
+                        },
+                        log_path=log_path,
+                    )
+                if not ok:
+                    answer = None
+
+            if not answer:
+                op_texts = [
+                    c.get("text", "")
+                    for c in evidence_chunks
+                    if normalize_block_type(c.get("block_type")) == "operation"
+                ]
+                ing_texts = [
+                    c.get("text", "")
+                    for c in evidence_chunks
+                    if normalize_block_type(c.get("block_type")) == "ingredients"
+                ]
+                parsed_steps = parse_steps(op_texts)
+                parsed_ingredients = parse_ingredients(ing_texts)
+                answer = _build_recipe_from_parsed(parsed_ingredients, parsed_steps)
+            if not answer:
+                answer = format_auto_answer(evidence_set)
+
+            if llm_call_polish and answer:
+                polish_payload = build_polish_payload(answer, intent="FULL_RECIPE")
+                polished = call_llm_polish(llm_call_polish, polish_payload)
+                ok, errors = validate_polish(answer, polished)
+                log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                fallback_reason = None
+                if not ok:
+                    if "number_out_of_bounds" in errors:
+                        fallback_reason = "out_of_bounds"
+                    elif "polished_empty" in errors:
+                        fallback_reason = "empty_output"
+                    else:
+                        fallback_reason = "validation_failed"
+                log_llm_call(
+                    {
+                        "span_name": "llm_call",
+                        "trace_id": trace_id,
+                        "stage": "polish",
+                        "intent": "FULL_RECIPE",
+                        "evidence_scope": "full",
+                        "llm_called": True,
+                        "llm_success": ok,
+                        "fallback_used": not ok,
+                        "fallback_reason": fallback_reason,
+                        "fallback_target": "use_draft" if not ok else None,
+                    },
+                    log_path=log_path,
+                )
+                if ok and polished:
+                    answer = polished
+
+            start_ts = time.time()
             if generation_log_path:
                 log_generation_started(
                     {
@@ -472,6 +639,8 @@ def run_once(
     evidence_log_path: Optional[Path] = None,
     evidence_insufficient: Optional[Dict] = None,
     turn: Optional[int] = None,
+    llm_call_extractor: Optional[LLMCall] = None,
+    llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
     state = _retrieve_state(
         query=query,
@@ -493,6 +662,9 @@ def run_once(
         session_id=None,
         turn=turn,
         generation_log_path=DEFAULT_GENERATION_LOG,
+        evidence_log_path=evidence_log_path,
+        llm_call_extractor=llm_call_extractor,
+        llm_call_polish=llm_call_polish,
     )
 
 
@@ -510,6 +682,8 @@ def run_session_once(
     evidence_log_path: Optional[Path] = None,
     evidence_insufficient: Optional[Dict] = None,
     turn: Optional[int] = None,
+    llm_call_extractor: Optional[LLMCall] = None,
+    llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
     session = load_session(session_id)
     now = time.time()
@@ -754,13 +928,54 @@ def run_session_once(
                 routing_log["upgraded_to_layer2"] = True
                 routing_log["upgrade_reason"] = "missing_block"
             else:
-                answer, missing_slots = generate_answer(
-                    intent,
-                    slots,
-                    evidence_layer1,
-                    parsed_steps=cached_steps,
-                    parsed_ingredients=cached_ingredients,
-                )
+                if llm_call_extractor:
+                    payload = build_extraction_payload(evidence_layer1, intent, evidence_scope="layer1")
+                    extraction = call_llm_extract(llm_call_extractor, payload)
+                    ok, errors = validate_extraction(extraction, evidence_layer1, expected_intent=intent)
+                    if ok:
+                        answer = _build_answer_from_extraction(extraction or {})
+                        if not answer:
+                            ok = False
+                            errors = ["empty_fields"]
+                    log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                    fallback_reason = None
+                    if not ok:
+                        if "citation_chunk_id_invalid" in errors or "citation_quote_not_found" in errors:
+                            fallback_reason = "bad_citation"
+                        elif "number_out_of_bounds" in errors:
+                            fallback_reason = "out_of_bounds"
+                        elif "empty_fields" in errors:
+                            fallback_reason = "empty_fields"
+                        elif "intent_mismatch" in errors or "fields_missing_or_invalid" in errors:
+                            fallback_reason = "invalid_schema"
+                        else:
+                            fallback_reason = "validation_failed"
+                    log_llm_call(
+                        {
+                            "span_name": "llm_call",
+                            "trace_id": trace_id,
+                            "stage": "extract",
+                            "intent": intent,
+                            "evidence_scope": "layer1",
+                            "llm_called": True,
+                            "llm_success": ok,
+                            "fallback_used": not ok,
+                            "fallback_reason": fallback_reason,
+                            "fallback_target": "rule_generate" if not ok else None,
+                        },
+                        log_path=log_path,
+                    )
+                    if not ok:
+                        answer = None
+
+                if not answer:
+                    answer, missing_slots = generate_answer(
+                        intent,
+                        slots,
+                        evidence_layer1,
+                        parsed_steps=cached_steps,
+                        parsed_ingredients=cached_ingredients,
+                    )
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_layer1.get("chunks", [])
                 ]
@@ -769,13 +984,54 @@ def run_session_once(
                     routing_log["upgrade_reason"] = "no_hit_sentence"
 
             if routing_log["upgraded_to_layer2"]:
-                answer, missing_slots = generate_answer(
-                    intent,
-                    slots,
-                    evidence_set,
-                    parsed_steps=cached_steps,
-                    parsed_ingredients=cached_ingredients,
-                )
+                if llm_call_extractor:
+                    payload = build_extraction_payload(evidence_set, intent, evidence_scope="layer2")
+                    extraction = call_llm_extract(llm_call_extractor, payload)
+                    ok, errors = validate_extraction(extraction, evidence_set, expected_intent=intent)
+                    if ok:
+                        answer = _build_answer_from_extraction(extraction or {})
+                        if not answer:
+                            ok = False
+                            errors = ["empty_fields"]
+                    log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                    fallback_reason = None
+                    if not ok:
+                        if "citation_chunk_id_invalid" in errors or "citation_quote_not_found" in errors:
+                            fallback_reason = "bad_citation"
+                        elif "number_out_of_bounds" in errors:
+                            fallback_reason = "out_of_bounds"
+                        elif "empty_fields" in errors:
+                            fallback_reason = "empty_fields"
+                        elif "intent_mismatch" in errors or "fields_missing_or_invalid" in errors:
+                            fallback_reason = "invalid_schema"
+                        else:
+                            fallback_reason = "validation_failed"
+                    log_llm_call(
+                        {
+                            "span_name": "llm_call",
+                            "trace_id": trace_id,
+                            "stage": "extract",
+                            "intent": intent,
+                            "evidence_scope": "layer2",
+                            "llm_called": True,
+                            "llm_success": ok,
+                            "fallback_used": not ok,
+                            "fallback_reason": fallback_reason,
+                            "fallback_target": "rule_generate" if not ok else None,
+                        },
+                        log_path=log_path,
+                    )
+                    if not ok:
+                        answer = None
+
+                if not answer:
+                    answer, missing_slots = generate_answer(
+                        intent,
+                        slots,
+                        evidence_set,
+                        parsed_steps=cached_steps,
+                        parsed_ingredients=cached_ingredients,
+                    )
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_set.get("chunks", [])
                 ]
@@ -791,6 +1047,37 @@ def run_session_once(
 
             sufficient, missing = evidence_sufficient(evidence_set)
             if answer and sufficient:
+                if llm_call_polish:
+                    polish_payload = build_polish_payload(answer, intent=intent)
+                    polished = call_llm_polish(llm_call_polish, polish_payload)
+                    ok, errors = validate_polish(answer, polished)
+                    log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                    fallback_reason = None
+                    if not ok:
+                        if "number_out_of_bounds" in errors:
+                            fallback_reason = "out_of_bounds"
+                        elif "polished_empty" in errors:
+                            fallback_reason = "empty_output"
+                        else:
+                            fallback_reason = "validation_failed"
+                    log_llm_call(
+                        {
+                            "span_name": "llm_call",
+                            "trace_id": trace_id,
+                            "stage": "polish",
+                            "intent": intent,
+                            "evidence_scope": "layer2" if routing_log["upgraded_to_layer2"] else "layer1",
+                            "llm_called": True,
+                            "llm_success": ok,
+                            "fallback_used": not ok,
+                            "fallback_reason": fallback_reason,
+                            "fallback_target": "use_draft" if not ok else None,
+                        },
+                        log_path=log_path,
+                    )
+                    if ok and polished:
+                        answer = polished
+
                 start_ts = time.time()
                 output_intent = output_intent_for(intent, slots)
                 final_evidence = evidence_set if routing_log["upgraded_to_layer2"] else evidence_layer1
@@ -952,7 +1239,15 @@ def run_session_once(
         evidence_insufficient=evidence_insufficient,
         turn=current_turn,
     )
-    output = _build_output_from_state(query, trace_id, state, include_candidates=True)
+    output = _build_output_from_state(
+        query,
+        trace_id,
+        state,
+        include_candidates=True,
+        evidence_log_path=evidence_log_path,
+        llm_call_extractor=llm_call_extractor,
+        llm_call_polish=llm_call_polish,
+    )
     if output.get("state") == "GOOD_BUT_AMBIGUOUS":
         pending_candidates = []
         for idx, ph in enumerate(state.parents, 1):
