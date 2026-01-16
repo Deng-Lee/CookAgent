@@ -418,9 +418,14 @@ def _build_output_from_state(
                 },
                 log_path=generation_log_path,
             )
+        state = (
+            "EVIDENCE_INSUFFICIENT"
+            if any(m in {"Ingredients", "Operation"} for m in missing)
+            else "LOW_EVIDENCE"
+        )
         return {
             "trace_id": trace_id,
-            "state": "LOW_EVIDENCE",
+            "state": state,
             "lock_status": "none",
             "message": "evidence_insufficient",
             "missing_block_types": missing,
@@ -675,9 +680,14 @@ def run_session_once(
                 },
                 log_path=DEFAULT_GENERATION_LOG,
             )
+            state = (
+                "EVIDENCE_INSUFFICIENT"
+                if any(m in {"Ingredients", "Operation"} for m in missing)
+                else "LOW_EVIDENCE"
+            )
             return {
                 "trace_id": trace_id,
-                "state": "LOW_EVIDENCE",
+                "state": state,
                 "lock_status": "locked",
                 "message": "evidence_insufficient",
                 "missing_block_types": missing,
@@ -916,9 +926,14 @@ def run_session_once(
                 },
                 log_path=DEFAULT_GENERATION_LOG,
             )
+            state = (
+                "EVIDENCE_INSUFFICIENT"
+                if any(m in {"Ingredients", "Operation"} for m in missing)
+                else "LOW_EVIDENCE"
+            )
             return {
                 "trace_id": trace_id,
-                "state": "LOW_EVIDENCE",
+                "state": state,
                 "lock_status": "locked",
                 "message": "evidence_insufficient",
                 "missing_block_types": missing,
