@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -53,6 +54,7 @@ from llm_utils import (
     validate_extraction,
     validate_polish,
 )
+from llm_client import llm_extract, llm_polish
 from logging_utils import (
     log_evidence_built,
     log_evidence_routing,
@@ -1324,11 +1326,31 @@ def parse_args() -> argparse.Namespace:
         default="cli_default",
         help="Session id for minimal persistence.",
     )
+    parser.add_argument("--llm", action="store_true", help="Enable LLM extraction and polish.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    llm_call_extractor = None
+    llm_call_polish = None
+    if args.llm:
+        env_path = Path(".env")
+        env_vars: Dict[str, str] = {}
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, value = stripped.split("=", 1)
+                env_vars[key.strip()] = value.strip().strip('"').strip("'")
+        model = env_vars.get("LLM_MODEL") or os.getenv("LLM_MODEL")
+        api_key = env_vars.get("LLM_API_KEY") or os.getenv("LLM_API_KEY")
+        if not model or not api_key:
+            print("LLM is enabled but LLM_MODEL or LLM_API_KEY is missing; falling back to rules.")
+        else:
+            llm_call_extractor = lambda payload: llm_extract(payload, model=model, api_key=api_key)
+            llm_call_polish = lambda payload: llm_polish(payload, model=model, api_key=api_key)
     if args.query:
         result = run_session_once(
             query=args.query.strip(),
@@ -1342,6 +1364,8 @@ def main() -> None:
             lock_log_path=args.lock_log_path,
             evidence_log_path=args.evidence_log_path,
             turn=args.turn,
+            llm_call_extractor=llm_call_extractor,
+            llm_call_polish=llm_call_polish,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
@@ -1364,6 +1388,8 @@ def main() -> None:
             lock_log_path=args.lock_log_path,
             evidence_log_path=args.evidence_log_path,
             turn=args.turn,
+            llm_call_extractor=llm_call_extractor,
+            llm_call_polish=llm_call_polish,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
