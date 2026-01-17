@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
@@ -28,8 +31,21 @@ def _deepseek_chat(
             "Authorization": f"Bearer {api_key}",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            last_error = None
+            break
+        except (urllib.error.URLError, socket.timeout, TimeoutError) as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(1)
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
     content = payload["choices"][0]["message"]["content"]
     return content.strip()
 

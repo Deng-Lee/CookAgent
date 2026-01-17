@@ -156,8 +156,7 @@ def generate_answer(
     if intent == "ASK_STEPS":
         steps = parsed_steps if parsed_steps is not None else parse_steps(op_texts)
         if steps:
-            preview = steps[:3]
-            return "步骤要点：\n" + "\n".join([f"- {s}" for s in preview]), []
+            return "完整步骤：\n" + "\n".join([f"- {s}" for s in steps]), []
         return None, ["steps"]
     if intent == "ASK_INGREDIENTS":
         items = parsed_ingredients if parsed_ingredients is not None else parse_ingredients(ing_texts)

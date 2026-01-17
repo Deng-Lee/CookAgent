@@ -25,6 +25,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 from splitter import Chunk, split_file
 
 LOCAL_MODEL_ENV = "LOCAL_BGE_M3_PATH"
+DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
 
 
 def resolve_local_model_path() -> str:
@@ -74,6 +75,7 @@ def chunk_records(path: Path, *, root: Path, strict: bool) -> List[dict]:
         rel_parts = list(path.parts)
     dir_path = "/".join(rel_parts[:-1]) if len(rel_parts) > 1 else ""
     dir_category = rel_parts[0] if rel_parts else ""
+    is_excluded_default = dir_category in DEFAULT_EXCLUDED_CATEGORIES
     # Inject a title-only chunk to boost dish name recall.
     if chunks:
         dish_name = chunks[0].meta.get("dish_name", path.stem)
@@ -89,6 +91,7 @@ def chunk_records(path: Path, *, root: Path, strict: bool) -> List[dict]:
                     "parent_id": str(path),
                     "dir_category": dir_category,
                     "dir_path": dir_path,
+                    "is_excluded_default": is_excluded_default,
                     "chunk_index": -1,
                     "total_chunks": total_chunks_with_title,
                 },
@@ -106,6 +109,7 @@ def chunk_records(path: Path, *, root: Path, strict: bool) -> List[dict]:
                     "parent_id": chunk.parent_id,
                     "dir_category": dir_category,
                     "dir_path": dir_path,
+                    "is_excluded_default": is_excluded_default,
                     "chunk_index": idx,
                     "total_chunks": total_chunks_with_title,
                 },

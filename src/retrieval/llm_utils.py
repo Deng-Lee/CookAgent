@@ -33,39 +33,56 @@ def build_polish_payload(
 
 
 def call_llm_extract(llm_call: Optional[LLMCall], payload: Dict) -> Optional[Dict]:
+    extraction, _ = call_llm_extract_with_debug(llm_call, payload)
+    return extraction
+
+
+def call_llm_extract_with_debug(
+    llm_call: Optional[LLMCall], payload: Dict
+) -> Tuple[Optional[Dict], Optional[str]]:
     if not llm_call:
-        return None
+        return None, None
     try:
         response = llm_call(payload)
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"exception:{exc}"
     if response is None:
-        return None
+        return None, "empty_response"
     if isinstance(response, dict):
-        return response
+        return response, None
     if isinstance(response, str):
         try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            return None
-    return None
+            return json.loads(response), None
+        except json.JSONDecodeError as exc:
+            return None, f"json_decode_error:{exc}"
+    return None, f"unsupported_response_type:{type(response).__name__}"
 
 
 def call_llm_polish(llm_call: Optional[LLMCall], payload: Dict) -> Optional[str]:
+    polished, _ = call_llm_polish_with_debug(llm_call, payload)
+    return polished
+
+
+def call_llm_polish_with_debug(
+    llm_call: Optional[LLMCall], payload: Dict
+) -> Tuple[Optional[str], Optional[str]]:
     if not llm_call:
-        return None
+        return None, None
     try:
         response = llm_call(payload)
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, f"exception:{exc}"
     if response is None:
-        return None
+        return None, "empty_response"
     if isinstance(response, str):
-        return response.strip() or None
+        text = response.strip()
+        return (text if text else None), ("empty_output" if not text else None)
     if isinstance(response, dict):
         text = response.get("text")
-        return text.strip() if isinstance(text, str) and text.strip() else None
-    return None
+        if isinstance(text, str) and text.strip():
+            return text.strip(), None
+        return None, "empty_output"
+    return None, f"unsupported_response_type:{type(response).__name__}"
 
 
 def _collect_evidence_chunks(evidence_set: Dict) -> Dict[str, str]:

@@ -30,8 +30,9 @@ def load_session(session_id: str) -> Dict:
     legacy_path = legacy_session_path(session_id)
     if not path.exists():
         if legacy_path.exists():
-            return json.loads(legacy_path.read_text(encoding="utf-8"))
-        return {
+            session = json.loads(legacy_path.read_text(encoding="utf-8"))
+        else:
+            session = {
             "session_id": session_id,
             "turn": 0,
             "last_trace_id": None,
@@ -43,11 +44,19 @@ def load_session(session_id: str) -> Dict:
                 "lock_reason": None,
             },
             "pending_candidates": [],
+            "pending_categories": [],
+            "category_filter": None,
             "parent_cache": None,
             "ttl_seconds": 900,
             "updated_at": None,
         }
-    return json.loads(path.read_text(encoding="utf-8"))
+    else:
+        session = json.loads(path.read_text(encoding="utf-8"))
+    session.setdefault("pending_candidates", [])
+    session.setdefault("pending_categories", [])
+    session.setdefault("category_filter", None)
+    session.setdefault("parent_lock", {"status": "none", "parent_id": None})
+    return session
 
 
 def save_session(session: Dict) -> None:
@@ -61,8 +70,6 @@ def purge_expired_pending(session: Dict) -> None:
     updated_at = session.get("updated_at")
     if not updated_at:
         return
-    if session.get("parent_lock", {}).get("status") != "pending":
-        return
     if (time.time() - updated_at) > ttl_seconds:
         session["parent_lock"] = {
             "status": "none",
@@ -72,6 +79,7 @@ def purge_expired_pending(session: Dict) -> None:
             "lock_reason": None,
         }
         session["pending_candidates"] = []
+        session["pending_categories"] = []
 
 
 def parse_option_id(text: str, candidates: List[Dict]) -> Optional[str]:

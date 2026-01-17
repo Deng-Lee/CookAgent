@@ -49,8 +49,8 @@ from llm_utils import (
     LLMCall,
     build_extraction_payload,
     build_polish_payload,
-    call_llm_extract,
-    call_llm_polish,
+    call_llm_extract_with_debug,
+    call_llm_polish_with_debug,
     validate_extraction,
     validate_polish,
 )
@@ -79,6 +79,53 @@ from retrieval_types import (
 from session_utils import load_session, parse_option_id, purge_expired_pending, save_session
 
 
+DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
+
+CATEGORY_SYNONYMS = {
+    "素菜": ["素", "素菜", "素食", "无肉"],
+    "荤菜": ["荤", "荤菜", "肉", "肉菜", "有肉"],
+    "水产": ["水产", "海鲜", "鱼", "虾", "蟹"],
+    "汤": ["汤", "羹", "煲汤"],
+    "甜点": ["甜点", "甜品", "点心"],
+    "饮料": ["饮料", "饮品", "奶茶", "果汁"],
+    "早餐": ["早餐", "早饭", "早点"],
+    "主食": ["主食", "饭", "面", "粥", "饼"],
+}
+
+
+def detect_categories(query: str) -> List[str]:
+    hits = []
+    text = query or ""
+    for category, words in CATEGORY_SYNONYMS.items():
+        if any(word in text for word in words):
+            hits.append(category)
+    return hits
+
+
+def resolve_category_choice(query: str, pending: List[Dict]) -> Optional[str]:
+    if not query or not pending:
+        return None
+    option_id = parse_option_id(query, pending)
+    if option_id:
+        hit = next((c for c in pending if c.get("option_id") == option_id), None)
+        return hit.get("category") if hit else None
+    for item in pending:
+        category = item.get("category")
+        if category and category in query:
+            return category
+    return None
+
+
+def build_category_where_filter(dir_category: Optional[str]) -> Optional[Dict]:
+    filters = []
+    if dir_category:
+        filters.append({"dir_category": dir_category})
+    filters.append({"is_excluded_default": False})
+    if not filters:
+        return None
+    if len(filters) == 1:
+        return filters[0]
+    return {"$and": filters}
 
 
 def _distance_to_score(distance: float) -> float:
@@ -197,7 +244,7 @@ def _retrieve_state(
         embedding_function=embedding_fn,
     )
 
-    where_filter = {"dir_category": dir_category} if dir_category else None
+    where_filter = build_category_where_filter(dir_category)
     res = collection.query(query_texts=[query], n_results=top_k, where=where_filter)
     parents = aggregate_hits(res)
     coverage_threshold = 0.5
@@ -252,7 +299,16 @@ def _retrieve_state(
         ph.parent_doc = load_parent_doc(ph.parent_id)
 
     if log_path:
-        log_retrieval(query, res, parents[:top_parents])
+        detected_categories = detect_categories(query)
+        log_retrieval(
+            query,
+            res,
+            parents[:top_parents],
+            detected_categories=detected_categories,
+            category_filter_applied=bool(dir_category),
+            category_conflict=len(detected_categories) > 1,
+            category_filtered_count=len(parents[:top_parents]),
+        )
     if lock_log_path:
         log_parent_lock(query, parent_lock, parents[:top_parents], log_path=lock_log_path)
     evidence_set = None
@@ -400,7 +456,7 @@ def _build_output_from_state(
             answer_source = None
             if llm_call_extractor:
                 payload = build_extraction_payload(evidence_set, "FULL_RECIPE", evidence_scope="full")
-                extraction = call_llm_extract(llm_call_extractor, payload)
+                extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
                 ok, errors = validate_extraction(extraction, evidence_set, expected_intent="FULL_RECIPE")
                 if ok:
                     answer = _build_recipe_from_extraction(extraction or {})
@@ -435,6 +491,7 @@ def _build_output_from_state(
                             "fallback_used": not ok,
                             "fallback_reason": fallback_reason,
                             "fallback_target": "rule_extract" if not ok else None,
+                            "llm_error": llm_error,
                         },
                         log_path=log_path,
                     )
@@ -461,9 +518,11 @@ def _build_output_from_state(
                 answer = format_auto_answer(evidence_set)
                 answer_source = "format_auto_answer"
 
+            polish_output_ts = None
             if llm_call_polish and answer:
+                polish_output_ts = time.time()
                 polish_payload = build_polish_payload(answer, intent="FULL_RECIPE")
-                polished = call_llm_polish(llm_call_polish, polish_payload)
+                polished, llm_error = call_llm_polish_with_debug(llm_call_polish, polish_payload)
                 ok, errors = validate_polish(answer, polished)
                 log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                 fallback_reason = None
@@ -486,6 +545,7 @@ def _build_output_from_state(
                         "fallback_used": not ok,
                         "fallback_reason": fallback_reason,
                         "fallback_target": "use_draft" if not ok else None,
+                        "llm_error": llm_error,
                     },
                     log_path=log_path,
                 )
@@ -567,6 +627,8 @@ def _build_output_from_state(
                     },
                     log_path=generation_log_path,
                 )
+                if polish_output_ts:
+                    print(f"润色后到输出耗时: {time.time() - polish_output_ts:.2f}s")
             return {
                 "trace_id": trace_id,
                 "state": "AUTO_RECOMMEND",
@@ -656,6 +718,19 @@ def run_once(
     llm_call_extractor: Optional[LLMCall] = None,
     llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
+    detected_categories = detect_categories(query)
+    if len(detected_categories) > 1:
+        pending = [
+            {"option_id": str(idx), "category": cat} for idx, cat in enumerate(sorted(detected_categories), 1)
+        ]
+        return {
+            "trace_id": trace_id,
+            "state": "GOOD_BUT_AMBIGUOUS",
+            "lock_status": "pending",
+            "pending_categories": pending,
+            "clarify_question": f"你是想看【{' / '.join(sorted(detected_categories))}】哪一类？",
+        }
+    dir_category = detected_categories[0] if detected_categories else None
     state = _retrieve_state(
         query=query,
         db_path=db_path,
@@ -711,6 +786,23 @@ def run_session_once(
 
     purge_expired_pending(session)
 
+    pending_categories = session.get("pending_categories") or []
+    selected_category: Optional[str] = None
+    if pending_categories:
+        selected_category = resolve_category_choice(query, pending_categories)
+        if selected_category:
+            session["pending_categories"] = []
+            session["updated_at"] = now
+            save_session(session)
+        else:
+            return {
+                "trace_id": trace_id,
+                "state": "GOOD_BUT_AMBIGUOUS",
+                "lock_status": "pending",
+                "pending_categories": pending_categories,
+                "clarify_question": f"你是想看【{' / '.join([c['category'] for c in pending_categories])}】哪一类？",
+            }
+
     option_id = parse_option_id(query, session.get("pending_candidates", []))
     if option_id:
         candidate = next(
@@ -734,11 +826,7 @@ def run_session_once(
             if evidence_log_path:
                 log_evidence_built(query, evidence_set, log_path=evidence_log_path)
             print(f"证据加载耗时: {time.time() - phase_ts:.2f}s")
-            intent_blocks = route_blocks(intent)
-            sufficient, missing = evidence_sufficient(
-                evidence_set,
-                required_blocks=intent_blocks if intent_blocks else None,
-            )
+            sufficient, missing = evidence_sufficient(evidence_set)
             if lock_log_path:
                 log_parent_lock(query, parent_lock, [], log_path=lock_log_path)
             op_texts = [
@@ -764,6 +852,7 @@ def run_session_once(
                 "lock_reason": "user_select",
             }
             session["pending_candidates"] = []
+            session["pending_categories"] = []
             session["last_trace_id"] = trace_id
             session["updated_at"] = now
             save_session(session)
@@ -828,9 +917,40 @@ def run_session_once(
                 )
                 answer = format_auto_answer(evidence_set)
                 print(f"抽取/生成耗时: {time.time() - phase_ts:.2f}s")
+                polish_output_ts = None
                 if llm_call_polish:
                     print("LLM 正在润色答案...")
                     phase_ts = time.time()
+                    polish_output_ts = phase_ts
+                    polish_payload = build_polish_payload(answer, intent="FULL_RECIPE")
+                    polished, llm_error = call_llm_polish_with_debug(llm_call_polish, polish_payload)
+                    ok, errors = validate_polish(answer, polished)
+                    log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
+                    fallback_reason = None
+                    if not ok:
+                        if "number_out_of_bounds" in errors:
+                            fallback_reason = "out_of_bounds"
+                        elif "polished_empty" in errors:
+                            fallback_reason = "empty_output"
+                        else:
+                            fallback_reason = "validation_failed"
+                    log_llm_call(
+                        {
+                            "span_name": "llm_call",
+                            "trace_id": trace_id,
+                            "stage": "polish",
+                            "intent": "FULL_RECIPE",
+                            "evidence_scope": "full",
+                            "llm_called": True,
+                            "llm_success": ok,
+                            "fallback_used": not ok,
+                            "fallback_reason": fallback_reason,
+                            "fallback_target": "use_draft" if not ok else None,
+                        },
+                        log_path=log_path,
+                    )
+                    if ok and polished:
+                        answer = polished
                 log_generation_completed(
                     {
                         "trace_id": trace_id,
@@ -856,6 +976,8 @@ def run_session_once(
                 )
                 if llm_call_polish:
                     print(f"润色耗时: {time.time() - phase_ts:.2f}s")
+                if polish_output_ts:
+                    print(f"润色后到输出耗时: {time.time() - polish_output_ts:.2f}s")
                 return {
                     "trace_id": trace_id,
                     "state": "AUTO_RECOMMEND",
@@ -975,7 +1097,7 @@ def run_session_once(
                 if llm_call_extractor:
                     print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_layer1, intent, evidence_scope="layer1")
-                    extraction = call_llm_extract(llm_call_extractor, payload)
+                    extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
                     ok, errors = validate_extraction(extraction, evidence_layer1, expected_intent=intent)
                     if ok:
                         answer = _build_answer_from_extraction(extraction or {})
@@ -1009,6 +1131,7 @@ def run_session_once(
                             "fallback_used": not ok,
                             "fallback_reason": fallback_reason,
                             "fallback_target": "rule_generate" if not ok else None,
+                            "llm_error": llm_error,
                         },
                         log_path=log_path,
                     )
@@ -1041,7 +1164,7 @@ def run_session_once(
                 if llm_call_extractor:
                     print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_set, intent, evidence_scope="layer2")
-                    extraction = call_llm_extract(llm_call_extractor, payload)
+                    extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
                     ok, errors = validate_extraction(extraction, evidence_set, expected_intent=intent)
                     if ok:
                         answer = _build_answer_from_extraction(extraction or {})
@@ -1075,6 +1198,7 @@ def run_session_once(
                             "fallback_used": not ok,
                             "fallback_reason": fallback_reason,
                             "fallback_target": "rule_generate" if not ok else None,
+                            "llm_error": llm_error,
                         },
                         log_path=log_path,
                     )
@@ -1108,10 +1232,12 @@ def run_session_once(
 
             sufficient, missing = evidence_sufficient(evidence_set)
             if answer and sufficient:
+                polish_output_ts = None
                 if llm_call_polish:
                     print("LLM 正在润色答案...")
+                    polish_output_ts = time.time()
                     polish_payload = build_polish_payload(answer, intent=intent)
-                    polished = call_llm_polish(llm_call_polish, polish_payload)
+                    polished, llm_error = call_llm_polish_with_debug(llm_call_polish, polish_payload)
                     ok, errors = validate_polish(answer, polished)
                     log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                     fallback_reason = None
@@ -1134,6 +1260,7 @@ def run_session_once(
                             "fallback_used": not ok,
                             "fallback_reason": fallback_reason,
                             "fallback_target": "use_draft" if not ok else None,
+                            "llm_error": llm_error,
                         },
                         log_path=log_path,
                     )
@@ -1218,6 +1345,8 @@ def run_session_once(
                     },
                     log_path=DEFAULT_GENERATION_LOG,
                 )
+                if polish_output_ts:
+                    print(f"润色后到输出耗时: {time.time() - polish_output_ts:.2f}s")
                 session["last_trace_id"] = trace_id
                 session["updated_at"] = now
                 save_session(session)
@@ -1290,6 +1419,36 @@ def run_session_once(
                 "clarify_question": "该菜谱未提及这一点，是否需要切换做法？",
             }
 
+    detected_categories = detect_categories(query)
+    if len(detected_categories) > 1:
+        pending = [
+            {"option_id": str(idx), "category": cat} for idx, cat in enumerate(sorted(detected_categories), 1)
+        ]
+        session["parent_lock"] = {
+            "status": "pending",
+            "parent_id": None,
+            "pending_reason": "category_conflict",
+            "lock_score": None,
+            "lock_reason": None,
+        }
+        session["pending_categories"] = pending
+        session["pending_candidates"] = []
+        session["parent_cache"] = None
+        session["last_trace_id"] = trace_id
+        session["updated_at"] = now
+        save_session(session)
+        return {
+            "trace_id": trace_id,
+            "state": "GOOD_BUT_AMBIGUOUS",
+            "lock_status": "pending",
+            "pending_categories": pending,
+            "clarify_question": f"你是想看【{' / '.join(sorted(detected_categories))}】哪一类？",
+        }
+    if detected_categories:
+        dir_category = detected_categories[0]
+    else:
+        dir_category = selected_category
+
     state = _retrieve_state(
         query=query,
         db_path=db_path,
@@ -1336,6 +1495,7 @@ def run_session_once(
         }
         session["pending_candidates"] = pending_candidates
         session["parent_cache"] = None
+        session["pending_categories"] = []
     else:
         session["parent_lock"] = {
             "status": state.parent_lock.status,
@@ -1345,6 +1505,7 @@ def run_session_once(
             "lock_reason": state.parent_lock.lock_reason,
         }
         session["pending_candidates"] = []
+        session["pending_categories"] = []
         if state.parent_lock.status != "locked":
             session["parent_cache"] = None
     session["last_trace_id"] = trace_id

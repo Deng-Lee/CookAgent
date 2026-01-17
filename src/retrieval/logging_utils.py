@@ -14,7 +14,17 @@ from retrieval_types import (
 )
 
 
-def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Path = Path("logs/retriever.log")) -> None:
+def log_retrieval(
+    query: str,
+    res: Dict,
+    parents: List[ParentHit],
+    *,
+    detected_categories: Optional[List[str]] = None,
+    category_filter_applied: bool = False,
+    category_conflict: bool = False,
+    category_filtered_count: Optional[int] = None,
+    log_path: Path = Path("logs/retriever.log"),
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     ids = res["ids"][0]
     documents = res["documents"][0]
@@ -69,6 +79,10 @@ def log_retrieval(query: str, res: Dict, parents: List[ParentHit], log_path: Pat
         "topk": len(vector_topk),
         "vector_topk": vector_topk,
         "parent_candidates": parent_candidates,
+        "detected_categories": detected_categories or [],
+        "category_filter_applied": category_filter_applied,
+        "category_conflict": category_conflict,
+        "category_filtered_count": category_filtered_count,
     }
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
