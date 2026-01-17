@@ -22,6 +22,36 @@ BLOCK_CANONICAL_TO_ORIG = {
     "title": "Title",
 }
 
+
+def _parse_cn_number(text: str) -> Optional[int]:
+    if not text:
+        return None
+    mapping = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+    }
+    if text == "十":
+        return 10
+    if "十" in text:
+        parts = text.split("十", 1)
+        tens = mapping.get(parts[0], 1) if parts[0] else 1
+        ones = mapping.get(parts[1], 0) if parts[1] else 0
+        return tens * 10 + ones
+    total = 0
+    for ch in text:
+        total += mapping.get(ch, 0)
+    return total or None
+
+
 def classify_query(query: str) -> Dict:
     text = query.strip()
     scores = {}
@@ -32,6 +62,13 @@ def classify_query(query: str) -> Dict:
         if m:
             slots["step_n"] = int(m.group(1))
         scores["ASK_STEP_N"] = 0.95
+    if re.search(r"第\s*([一二三四五六七八九十两]+)\s*步", text):
+        m = re.search(r"第\s*([一二三四五六七八九十两]+)\s*步", text)
+        if m:
+            step_n = _parse_cn_number(m.group(1))
+            if step_n:
+                slots["step_n"] = step_n
+        scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), 0.95)
     if re.search(r"第一步|第1步", text):
         slots["step_n"] = 1
         scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), 0.95)

@@ -1040,6 +1040,7 @@ def run_session_once(
             confidence = routing["confidence"]
             slots = routing["slots"]
             print(f"意图识别完成：{intent}（置信度 {confidence:.2f}）。")
+            print(f"意图识别详情: intent={intent}, confidence={confidence:.2f}, slots={slots}")
             intent_min = 0.5
             layer1_blocks = route_blocks(intent) if confidence >= intent_min else []
             selected_blocks = layer1_blocks
