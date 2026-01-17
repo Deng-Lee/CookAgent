@@ -456,7 +456,11 @@ def _build_output_from_state(
             answer_source = None
             if llm_call_extractor:
                 payload = build_extraction_payload(evidence_set, "FULL_RECIPE", evidence_scope="full")
+                llm_start_ts = time.time()
                 extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
+                print(f"LLM 抽取耗时: {time.time() - llm_start_ts:.2f}s")
+                if llm_error and "timed out" in llm_error:
+                    print("LLM 抽取超时，进入回退流程。")
                 ok, errors = validate_extraction(extraction, evidence_set, expected_intent="FULL_RECIPE")
                 if ok:
                     answer = _build_recipe_from_extraction(extraction or {})
@@ -522,7 +526,11 @@ def _build_output_from_state(
             if llm_call_polish and answer:
                 polish_output_ts = time.time()
                 polish_payload = build_polish_payload(answer, intent="FULL_RECIPE")
+                llm_start_ts = time.time()
                 polished, llm_error = call_llm_polish_with_debug(llm_call_polish, polish_payload)
+                print(f"LLM 润色耗时: {time.time() - llm_start_ts:.2f}s")
+                if llm_error and "timed out" in llm_error:
+                    print("LLM 润色超时，使用未润色答案。")
                 ok, errors = validate_polish(answer, polished)
                 log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                 fallback_reason = None
@@ -1098,7 +1106,11 @@ def run_session_once(
                 if llm_call_extractor:
                     print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_layer1, intent, evidence_scope="layer1")
+                    llm_start_ts = time.time()
                     extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
+                    print(f"LLM 抽取耗时: {time.time() - llm_start_ts:.2f}s")
+                    if llm_error and "timed out" in llm_error:
+                        print("LLM 抽取超时，进入回退流程。")
                     ok, errors = validate_extraction(extraction, evidence_layer1, expected_intent=intent)
                     if ok:
                         answer = _build_answer_from_extraction(extraction or {})
@@ -1165,7 +1177,11 @@ def run_session_once(
                 if llm_call_extractor:
                     print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_set, intent, evidence_scope="layer2")
+                    llm_start_ts = time.time()
                     extraction, llm_error = call_llm_extract_with_debug(llm_call_extractor, payload)
+                    print(f"LLM 抽取耗时: {time.time() - llm_start_ts:.2f}s")
+                    if llm_error and "timed out" in llm_error:
+                        print("LLM 抽取超时，进入回退流程。")
                     ok, errors = validate_extraction(extraction, evidence_set, expected_intent=intent)
                     if ok:
                         answer = _build_answer_from_extraction(extraction or {})
@@ -1238,7 +1254,11 @@ def run_session_once(
                     print("LLM 正在润色答案...")
                     polish_output_ts = time.time()
                     polish_payload = build_polish_payload(answer, intent=intent)
+                    llm_start_ts = time.time()
                     polished, llm_error = call_llm_polish_with_debug(llm_call_polish, polish_payload)
+                    print(f"LLM 润色耗时: {time.time() - llm_start_ts:.2f}s")
+                    if llm_error and "timed out" in llm_error:
+                        print("LLM 润色超时，使用未润色答案。")
                     ok, errors = validate_polish(answer, polished)
                     log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                     fallback_reason = None
