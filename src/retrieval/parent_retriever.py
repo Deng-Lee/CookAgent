@@ -1357,7 +1357,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Parent-level retrieval with aggregation.")
     parser.add_argument("--query", help="User query text. If omitted, will prompt interactively.")
     parser.add_argument("--db-path", type=Path, default=Path("data/chroma"), help="Chroma persistence path.")
-    parser.add_argument("--collection", type=str, default="cook_chunks_v1", help="Collection name.")
+    parser.add_argument("--collection", type=str, default="cook_chunks", help="Collection name.")
     parser.add_argument("--top-k", type=int, default=25, help="Chunk-level n_results.")
     parser.add_argument("--top-parents", type=int, default=5, help="How many parent docs to return.")
     parser.add_argument("--log-path", type=Path, default=Path("logs/retriever.log"), help="Path to append JSON logs.")
