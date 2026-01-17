@@ -3,20 +3,34 @@ from __future__ import annotations
 import json
 import re
 import time
+from hashlib import sha1
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from retrieval_types import DEFAULT_SESSION_DIR
 
 
+def _safe_session_name(session_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", session_id.strip() or "cli_default")
+
+
 def session_path(session_id: str) -> Path:
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", session_id.strip() or "cli_default")
+    safe = _safe_session_name(session_id)
+    digest = sha1(session_id.encode("utf-8")).hexdigest()[:8]
+    return DEFAULT_SESSION_DIR / f"{safe}-{digest}.json"
+
+
+def legacy_session_path(session_id: str) -> Path:
+    safe = _safe_session_name(session_id)
     return DEFAULT_SESSION_DIR / f"{safe}.json"
 
 
 def load_session(session_id: str) -> Dict:
     path = session_path(session_id)
+    legacy_path = legacy_session_path(session_id)
     if not path.exists():
+        if legacy_path.exists():
+            return json.loads(legacy_path.read_text(encoding="utf-8"))
         return {
             "session_id": session_id,
             "turn": 0,

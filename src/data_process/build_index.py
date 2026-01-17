@@ -62,11 +62,18 @@ def iter_markdown_files(root: Path) -> Iterable[Path]:
     yield from root.rglob("*.md")
 
 
-def chunk_records(path: Path, *, strict: bool) -> List[dict]:
+def chunk_records(path: Path, *, root: Path, strict: bool) -> List[dict]:
     """Split one markdown file and build records for Chroma upsert."""
     chunks: List[Chunk] = split_file(path, strict=strict)
     records: List[dict] = []
     total_chunks = len(chunks)
+    rel_parts = []
+    try:
+        rel_parts = list(path.relative_to(root).parts)
+    except ValueError:
+        rel_parts = list(path.parts)
+    dir_path = "/".join(rel_parts[:-1]) if len(rel_parts) > 1 else ""
+    dir_category = rel_parts[0] if rel_parts else ""
     # Inject a title-only chunk to boost dish name recall.
     if chunks:
         dish_name = chunks[0].meta.get("dish_name", path.stem)
@@ -80,6 +87,8 @@ def chunk_records(path: Path, *, strict: bool) -> List[dict]:
                     "dish_name": dish_name,
                     "category": "Title",
                     "parent_id": str(path),
+                    "dir_category": dir_category,
+                    "dir_path": dir_path,
                     "chunk_index": -1,
                     "total_chunks": total_chunks_with_title,
                 },
@@ -95,6 +104,8 @@ def chunk_records(path: Path, *, strict: bool) -> List[dict]:
                 "metadata": {
                     **chunk.meta,
                     "parent_id": chunk.parent_id,
+                    "dir_category": dir_category,
+                    "dir_path": dir_path,
                     "chunk_index": idx,
                     "total_chunks": total_chunks_with_title,
                 },
@@ -124,7 +135,7 @@ def build_collection(
 
     total_chunks = 0
     for md_file in iter_markdown_files(root):
-        records = chunk_records(md_file, strict=strict)
+        records = chunk_records(md_file, root=root, strict=strict)
         if not records:
             continue
         collection.upsert(

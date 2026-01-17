@@ -179,6 +179,7 @@ def _retrieve_state(
     *,
     top_k: int = 25,
     top_parents: int = 5,
+    dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
@@ -196,7 +197,8 @@ def _retrieve_state(
         embedding_function=embedding_fn,
     )
 
-    res = collection.query(query_texts=[query], n_results=top_k)
+    where_filter = {"dir_category": dir_category} if dir_category else None
+    res = collection.query(query_texts=[query], n_results=top_k, where=where_filter)
     parents = aggregate_hits(res)
     coverage_threshold = 0.5
     any_eligible = any(ph.coverage_ratio >= coverage_threshold for ph in parents)
@@ -281,6 +283,7 @@ def retrieve(
     *,
     top_k: int = 25,
     top_parents: int = 5,
+    dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
@@ -293,6 +296,7 @@ def retrieve(
         collection_name=collection_name,
         top_k=top_k,
         top_parents=top_parents,
+        dir_category=dir_category,
         log_path=log_path,
         lock_log_path=lock_log_path,
         evidence_log_path=evidence_log_path,
@@ -393,6 +397,7 @@ def _build_output_from_state(
                 {normalize_block_type(c.get("block_type")) for c in evidence_chunks if c.get("block_type")}
             )
             answer = None
+            answer_source = None
             if llm_call_extractor:
                 payload = build_extraction_payload(evidence_set, "FULL_RECIPE", evidence_scope="full")
                 extraction = call_llm_extract(llm_call_extractor, payload)
@@ -402,6 +407,8 @@ def _build_output_from_state(
                     if not answer:
                         ok = False
                         errors = ["empty_fields"]
+                    else:
+                        answer_source = "llm_extract"
                 log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                 if log_path:
                     fallback_reason = None
@@ -448,8 +455,11 @@ def _build_output_from_state(
                 parsed_steps = parse_steps(op_texts)
                 parsed_ingredients = parse_ingredients(ing_texts)
                 answer = _build_recipe_from_parsed(parsed_ingredients, parsed_steps)
+                if answer:
+                    answer_source = "rule_extract"
             if not answer:
                 answer = format_auto_answer(evidence_set)
+                answer_source = "format_auto_answer"
 
             if llm_call_polish and answer:
                 polish_payload = build_polish_payload(answer, intent="FULL_RECIPE")
@@ -548,6 +558,7 @@ def _build_output_from_state(
                             "char_count": len(answer),
                             "preview": answer[:200],
                         },
+                        "answer_source": answer_source,
                         "evidence": {
                             "parent_id": parent_lock.parent_id,
                             "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
@@ -636,6 +647,7 @@ def run_once(
     collection_name: str,
     top_k: int = 25,
     top_parents: int = 5,
+    dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
@@ -650,6 +662,7 @@ def run_once(
         collection_name=collection_name,
         top_k=top_k,
         top_parents=top_parents,
+        dir_category=dir_category,
         log_path=log_path,
         lock_log_path=lock_log_path,
         evidence_log_path=evidence_log_path,
@@ -679,6 +692,7 @@ def run_session_once(
     collection_name: str,
     top_k: int = 25,
     top_parents: int = 5,
+    dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
@@ -687,6 +701,8 @@ def run_session_once(
     llm_call_extractor: Optional[LLMCall] = None,
     llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
+    print("正在对相关文档进行排序...")
+    phase_ts = time.time()
     session = load_session(session_id)
     now = time.time()
     last_turn = session.get("turn") or 0
@@ -701,6 +717,9 @@ def run_session_once(
             (c for c in session.get("pending_candidates", []) if c.get("option_id") == option_id), None
         )
         if candidate:
+            print("已对文档进行锁定。")
+            print(f"锁定耗时: {time.time() - phase_ts:.2f}s")
+            phase_ts = time.time()
             parent_id = candidate.get("parent_id")
             lock_score = candidate.get("overall_score")
             parent_lock = ParentLock(
@@ -714,6 +733,7 @@ def run_session_once(
             evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
             if evidence_log_path:
                 log_evidence_built(query, evidence_set, log_path=evidence_log_path)
+            print(f"证据加载耗时: {time.time() - phase_ts:.2f}s")
             intent_blocks = route_blocks(intent)
             sufficient, missing = evidence_sufficient(
                 evidence_set,
@@ -748,6 +768,10 @@ def run_session_once(
             session["updated_at"] = now
             save_session(session)
             if sufficient:
+                print("正在抽取证据链...")
+                if llm_call_extractor:
+                    print("LLM 正在抽取信息...")
+                phase_ts = time.time()
                 start_ts = time.time()
                 evidence_chunks = evidence_set.get("chunks", []) if evidence_set else []
                 block_types = sorted(
@@ -803,6 +827,10 @@ def run_session_once(
                     log_path=DEFAULT_GENERATION_LOG,
                 )
                 answer = format_auto_answer(evidence_set)
+                print(f"抽取/生成耗时: {time.time() - phase_ts:.2f}s")
+                if llm_call_polish:
+                    print("LLM 正在润色答案...")
+                    phase_ts = time.time()
                 log_generation_completed(
                     {
                         "trace_id": trace_id,
@@ -817,6 +845,7 @@ def run_session_once(
                             "char_count": len(answer),
                             "preview": answer[:200],
                         },
+                        "answer_source": "format_auto_answer",
                         "evidence": {
                             "parent_id": parent_id,
                             "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
@@ -825,6 +854,8 @@ def run_session_once(
                     },
                     log_path=DEFAULT_GENERATION_LOG,
                 )
+                if llm_call_polish:
+                    print(f"润色耗时: {time.time() - phase_ts:.2f}s")
                 return {
                     "trace_id": trace_id,
                     "state": "AUTO_RECOMMEND",
@@ -873,14 +904,20 @@ def run_session_once(
     if session.get("parent_lock", {}).get("status") == "locked":
         parent_id = session.get("parent_lock", {}).get("parent_id")
         if parent_id:
+            print("已对文档进行锁定。")
+            print(f"锁定耗时: {time.time() - phase_ts:.2f}s")
+            phase_ts = time.time()
+            print("正在加载锁定文档的证据...")
             evidence_set = build_evidence_set_for_parent(db_path, collection_name, parent_id)
             if evidence_log_path:
                 log_evidence_built(query, evidence_set, log_path=evidence_log_path)
+            print(f"证据加载耗时: {time.time() - phase_ts:.2f}s")
 
             routing = classify_query(query)
             intent = routing["intent"]
             confidence = routing["confidence"]
             slots = routing["slots"]
+            print(f"意图识别完成：{intent}（置信度 {confidence:.2f}）。")
             intent_min = 0.5
             layer1_blocks = route_blocks(intent) if confidence >= intent_min else []
             selected_blocks = layer1_blocks
@@ -922,15 +959,21 @@ def run_session_once(
             }
 
             answer = None
+            answer_source = None
             missing_slots: List[str] = []
             if confidence < intent_min:
                 routing_log["upgraded_to_layer2"] = True
                 routing_log["upgrade_reason"] = "low_confidence"
+                print("意图置信度较低，已升级到全量证据。")
             elif not evidence_layer1 or not evidence_layer1.get("chunks"):
                 routing_log["upgraded_to_layer2"] = True
                 routing_log["upgrade_reason"] = "missing_block"
+                print("意图相关块不足，已升级到全量证据。")
             else:
+                print("正在抽取证据链...")
+                phase_ts = time.time()
                 if llm_call_extractor:
+                    print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_layer1, intent, evidence_scope="layer1")
                     extraction = call_llm_extract(llm_call_extractor, payload)
                     ok, errors = validate_extraction(extraction, evidence_layer1, expected_intent=intent)
@@ -939,6 +982,8 @@ def run_session_once(
                         if not answer:
                             ok = False
                             errors = ["empty_fields"]
+                        else:
+                            answer_source = "llm_extract_layer1"
                     log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                     fallback_reason = None
                     if not ok:
@@ -971,6 +1016,7 @@ def run_session_once(
                         answer = None
 
                 if not answer:
+                    print("正在生成回答...")
                     answer, missing_slots = generate_answer(
                         intent,
                         slots,
@@ -978,15 +1024,22 @@ def run_session_once(
                         parsed_steps=cached_steps,
                         parsed_ingredients=cached_ingredients,
                     )
+                    if answer:
+                        answer_source = "rule_generate_layer1"
+                print(f"抽取/生成耗时: {time.time() - phase_ts:.2f}s")
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_layer1.get("chunks", [])
                 ]
                 if (not answer) or missing_slots:
                     routing_log["upgraded_to_layer2"] = True
                     routing_log["upgrade_reason"] = "no_hit_sentence"
+                    print("局部证据未命中，升级到全量证据。")
 
             if routing_log["upgraded_to_layer2"]:
+                print("正在抽取证据链（扩展范围）...")
+                phase_ts = time.time()
                 if llm_call_extractor:
+                    print("LLM 正在抽取信息...")
                     payload = build_extraction_payload(evidence_set, intent, evidence_scope="layer2")
                     extraction = call_llm_extract(llm_call_extractor, payload)
                     ok, errors = validate_extraction(extraction, evidence_set, expected_intent=intent)
@@ -995,6 +1048,8 @@ def run_session_once(
                         if not answer:
                             ok = False
                             errors = ["empty_fields"]
+                        else:
+                            answer_source = "llm_extract_layer2"
                     log_path = evidence_log_path or DEFAULT_EVIDENCE_LOG
                     fallback_reason = None
                     if not ok:
@@ -1027,6 +1082,7 @@ def run_session_once(
                         answer = None
 
                 if not answer:
+                    print("正在生成回答...")
                     answer, missing_slots = generate_answer(
                         intent,
                         slots,
@@ -1034,6 +1090,9 @@ def run_session_once(
                         parsed_steps=cached_steps,
                         parsed_ingredients=cached_ingredients,
                     )
+                    if answer:
+                        answer_source = "rule_generate_layer2"
+                print(f"抽取/生成耗时: {time.time() - phase_ts:.2f}s")
                 routing_log["final_evidence_chunk_ids"] = [
                     c.get("chunk_id") for c in evidence_set.get("chunks", [])
                 ]
@@ -1050,6 +1109,7 @@ def run_session_once(
             sufficient, missing = evidence_sufficient(evidence_set)
             if answer and sufficient:
                 if llm_call_polish:
+                    print("LLM 正在润色答案...")
                     polish_payload = build_polish_payload(answer, intent=intent)
                     polished = call_llm_polish(llm_call_polish, polish_payload)
                     ok, errors = validate_polish(answer, polished)
@@ -1149,6 +1209,7 @@ def run_session_once(
                             "char_count": len(answer),
                             "preview": answer[:200],
                         },
+                        "answer_source": answer_source,
                         "evidence": {
                             "parent_id": parent_id,
                             "chunk_ids": [c.get("chunk_id") for c in evidence_chunks if c.get("chunk_id")],
@@ -1235,12 +1296,16 @@ def run_session_once(
         collection_name=collection_name,
         top_k=top_k,
         top_parents=top_parents,
+        dir_category=dir_category,
         log_path=log_path,
         lock_log_path=lock_log_path,
         evidence_log_path=evidence_log_path,
         evidence_insufficient=evidence_insufficient,
         turn=current_turn,
     )
+    if state.parent_lock.status == "locked":
+        print("已对文档进行锁定。")
+        print(f"锁定耗时: {time.time() - phase_ts:.2f}s")
     output = _build_output_from_state(
         query,
         trace_id,

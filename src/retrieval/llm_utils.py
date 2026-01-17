@@ -35,7 +35,10 @@ def build_polish_payload(
 def call_llm_extract(llm_call: Optional[LLMCall], payload: Dict) -> Optional[Dict]:
     if not llm_call:
         return None
-    response = llm_call(payload)
+    try:
+        response = llm_call(payload)
+    except Exception:
+        return None
     if response is None:
         return None
     if isinstance(response, dict):
@@ -51,7 +54,10 @@ def call_llm_extract(llm_call: Optional[LLMCall], payload: Dict) -> Optional[Dic
 def call_llm_polish(llm_call: Optional[LLMCall], payload: Dict) -> Optional[str]:
     if not llm_call:
         return None
-    response = llm_call(payload)
+    try:
+        response = llm_call(payload)
+    except Exception:
+        return None
     if response is None:
         return None
     if isinstance(response, str):
