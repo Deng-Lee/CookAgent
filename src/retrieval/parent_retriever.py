@@ -313,7 +313,7 @@ def _retrieve_state(
         log_parent_lock(query, parent_lock, parents[:top_parents], log_path=lock_log_path)
     evidence_set = None
     if parent_lock.status == "locked" and parents:
-        evidence_set = build_evidence_set(parents[0])
+        evidence_set = build_evidence_set_for_parent(db_path, collection_name, parents[0].parent_id)
         if evidence_log_path:
             log_evidence_built(query, evidence_set, log_path=evidence_log_path)
     if evidence_insufficient and parent_lock.status == "locked" and evidence_set:
