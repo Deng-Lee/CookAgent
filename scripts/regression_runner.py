@@ -54,7 +54,7 @@ def test_category_pending(db_path: Path, collection: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal regression runner.")
     parser.add_argument("--db-path", type=Path, default=Path("data/chroma"))
-    parser.add_argument("--collection", type=str, default="cook_chunks_v1")
+    parser.add_argument("--collection", type=str, default="cook_chunks")
     args = parser.parse_args()
 
     results = [

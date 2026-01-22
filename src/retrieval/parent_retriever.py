@@ -10,7 +10,7 @@ Usage:
   python src/retrieval/parent_retriever.py \
     --query "白灼虾怎么做" \
     --db-path data/chroma \
-    --collection cook_chunks_v1 \
+    --collection cook_chunks \
     --top-k 25 \
     --top-parents 5
 """
