@@ -65,6 +65,7 @@ from logging_utils import (
     log_generation_completed,
     log_generation_mapping,
     log_llm_call,
+    log_category_presearch,
 )
 from model_utils import resolve_local_model_path
 from retrieval_types import (
@@ -80,6 +81,7 @@ from session_utils import load_session, parse_option_id, purge_expired_pending, 
 
 
 DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
+DISH_TITLE_MIN = 0.8
 
 CATEGORY_SYNONYMS = {
     "素菜": ["素", "素菜", "素食", "无肉"],
@@ -100,6 +102,43 @@ def detect_categories(query: str) -> List[str]:
         if any(word in text for word in words):
             hits.append(category)
     return hits
+
+
+def _presearch_top1_hit(
+    query: str,
+    db_path: Path,
+    collection_name: str,
+) -> Optional[Dict]:
+    model_path = resolve_local_model_path()
+    embedding_fn = SentenceTransformerEmbeddingFunction(
+        model_name=model_path,
+        model_kwargs={"local_files_only": True},
+    )
+    client = chromadb.PersistentClient(path=str(db_path))
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        embedding_function=embedding_fn,
+    )
+    where_filter = build_category_where_filter(None)
+    res = collection.query(query_texts=[query], n_results=1, where=where_filter)
+    if not res.get("ids"):
+        return None
+    ids = res.get("ids", [[]])[0]
+    metadatas = res.get("metadatas", [[]])[0]
+    documents = res.get("documents", [[]])[0]
+    distances = res.get("distances", [[]])[0]
+    if not ids or not distances:
+        return None
+    score = _distance_to_score(distances[0])
+    meta = metadatas[0] if metadatas else {}
+    doc = documents[0] if documents else ""
+    return {
+        "chunk_id": ids[0],
+        "parent_id": meta.get("parent_id") if isinstance(meta, dict) else None,
+        "block_type": meta.get("category") if isinstance(meta, dict) else None,
+        "score": score,
+        "snippet_80": doc.replace("\n", " ")[:80] if isinstance(doc, str) else None,
+    }
 
 
 def resolve_category_choice(query: str, pending: List[Dict]) -> Optional[str]:
@@ -308,6 +347,7 @@ def _retrieve_state(
             category_filter_applied=bool(dir_category),
             category_conflict=len(detected_categories) > 1,
             category_filtered_count=len(parents[:top_parents]),
+            log_path=log_path,
         )
     if lock_log_path:
         log_parent_lock(query, parent_lock, parents[:top_parents], log_path=lock_log_path)
@@ -728,14 +768,49 @@ def run_once(
 ) -> Dict:
     detected_categories = detect_categories(query)
     if len(detected_categories) > 1:
-        pending = [
+        fallback_pending = [
             {"option_id": str(idx), "category": cat} for idx, cat in enumerate(sorted(detected_categories), 1)
         ]
+        top1_hit = _presearch_top1_hit(query, db_path, collection_name)
+        top1_score = top1_hit.get("score") if top1_hit else None
+        if log_path:
+            log_category_presearch(
+                query,
+                detected_categories,
+                top1_score=top1_score,
+                threshold=DISH_TITLE_MIN,
+                top1_hit=top1_hit,
+                log_path=log_path,
+            )
+        if top1_score is not None and top1_score >= DISH_TITLE_MIN:
+            state = _retrieve_state(
+                query=query,
+                db_path=db_path,
+                collection_name=collection_name,
+                top_k=top_k,
+                top_parents=top_parents,
+                dir_category=None,
+                log_path=log_path,
+                lock_log_path=lock_log_path,
+                evidence_log_path=evidence_log_path,
+                evidence_insufficient=evidence_insufficient,
+                turn=turn,
+            )
+            return _build_output_from_state(
+                query,
+                trace_id,
+                state,
+                include_candidates=False,
+                session_id=None,
+                turn=turn,
+                generation_log_path=DEFAULT_GENERATION_LOG,
+                evidence_log_path=evidence_log_path,
+            )
         return {
             "trace_id": trace_id,
             "state": "GOOD_BUT_AMBIGUOUS",
             "lock_status": "pending",
-            "pending_categories": pending,
+            "pending_categories": fallback_pending,
             "clarify_question": f"你是想看【{' / '.join(sorted(detected_categories))}】哪一类？",
         }
     dir_category = detected_categories[0] if detected_categories else None
@@ -1442,30 +1517,44 @@ def run_session_once(
 
     detected_categories = detect_categories(query)
     if len(detected_categories) > 1:
-        pending = [
-            {"option_id": str(idx), "category": cat} for idx, cat in enumerate(sorted(detected_categories), 1)
-        ]
-        session["parent_lock"] = {
-            "status": "pending",
-            "parent_id": None,
-            "pending_reason": "category_conflict",
-            "lock_score": None,
-            "lock_reason": None,
-        }
-        session["pending_categories"] = pending
-        session["pending_candidates"] = []
-        session["parent_cache"] = None
-        session["last_trace_id"] = trace_id
-        session["updated_at"] = now
-        save_session(session)
-        return {
-            "trace_id": trace_id,
-            "state": "GOOD_BUT_AMBIGUOUS",
-            "lock_status": "pending",
-            "pending_categories": pending,
-            "clarify_question": f"你是想看【{' / '.join(sorted(detected_categories))}】哪一类？",
-        }
-    if detected_categories:
+        top1_hit = _presearch_top1_hit(query, db_path, collection_name)
+        top1_score = top1_hit.get("score") if top1_hit else None
+        if log_path:
+            log_category_presearch(
+                query,
+                detected_categories,
+                top1_score=top1_score,
+                threshold=DISH_TITLE_MIN,
+                top1_hit=top1_hit,
+                log_path=log_path,
+            )
+        if top1_score is not None and top1_score >= DISH_TITLE_MIN:
+            dir_category = None
+        else:
+            pending = [
+                {"option_id": str(idx), "category": cat} for idx, cat in enumerate(sorted(detected_categories), 1)
+            ]
+            session["parent_lock"] = {
+                "status": "pending",
+                "parent_id": None,
+                "pending_reason": "category_conflict",
+                "lock_score": None,
+                "lock_reason": None,
+            }
+            session["pending_categories"] = pending
+            session["pending_candidates"] = []
+            session["parent_cache"] = None
+            session["last_trace_id"] = trace_id
+            session["updated_at"] = now
+            save_session(session)
+            return {
+                "trace_id": trace_id,
+                "state": "GOOD_BUT_AMBIGUOUS",
+                "lock_status": "pending",
+                "pending_categories": pending,
+                "clarify_question": f"你是想看【{' / '.join(sorted(detected_categories))}】哪一类？",
+            }
+    elif detected_categories:
         dir_category = detected_categories[0]
     else:
         dir_category = selected_category

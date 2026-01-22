@@ -241,3 +241,27 @@ def log_llm_call(
     payload = {"timestamp": datetime.datetime.utcnow().isoformat() + "Z", **record}
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def log_category_presearch(
+    query: str,
+    detected_categories: List[str],
+    *,
+    top1_score: Optional[float],
+    threshold: float,
+    top1_hit: Optional[Dict],
+    log_path: Path = Path("logs/retriever.log"),
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "span_name": "category_presearch",
+        "query": query,
+        "detected_categories": detected_categories,
+        "top1_score": top1_score,
+        "threshold": threshold,
+        "passed": top1_score is not None and top1_score >= threshold,
+        "top1_hit": top1_hit,
+    }
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")

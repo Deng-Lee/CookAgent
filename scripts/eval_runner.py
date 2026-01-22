@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -56,13 +57,18 @@ def _parent_matches(expected_ids: List[str], result: Dict[str, Any]) -> bool:
     return False
 
 
+def _next_index(output_dir: Path, prefix: str) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(output_dir.glob(f"{prefix}_*.jsonl"))
+    return len(existing) + 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch eval runner for eval_set_v1.jsonl")
     parser.add_argument("--eval-path", type=Path, default=Path("src/test/eval_set_v1.jsonl"))
     parser.add_argument("--db-path", type=Path, default=Path("data/chroma"))
     parser.add_argument("--collection", type=str, default="cook_chunks")
-    parser.add_argument("--output-path", type=Path, default=Path("logs/eval_report.jsonl"))
-    parser.add_argument("--fail-path", type=Path, default=Path("logs/eval_failures.jsonl"))
+    parser.add_argument("--output-dir", type=Path, default=Path("result"))
     args = parser.parse_args()
 
     items = _load_jsonl(args.eval_path)
@@ -70,6 +76,7 @@ def main() -> int:
     failed = 0
     output_lines: List[str] = []
     failure_lines: List[str] = []
+    run_id = uuid.uuid4().hex[:8]
     for item in items:
         eval_id = item["id"]
         query = item["query"]
@@ -77,9 +84,12 @@ def main() -> int:
         result = run_session_once(
             query=query,
             trace_id=eval_id,
-            session_id=f"eval_{eval_id}",
+            session_id=f"eval_{run_id}_{eval_id}",
             db_path=args.db_path,
             collection_name=args.collection,
+            log_path=project_root / "logs" / "retriever.log",
+            lock_log_path=project_root / "logs" / "parent_locking.log",
+            evidence_log_path=project_root / "logs" / "evidence_driven.log",
         )
 
         ok_state = _state_matches(expected.get("state"), result.get("state"))
@@ -124,11 +134,14 @@ def main() -> int:
     total = passed + failed
     summary = {"total": total, "passed": passed, "failed": failed}
     output_lines.append(json.dumps({"summary": summary}, ensure_ascii=False))
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    args.output_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
-    args.fail_path.write_text("\n".join(failure_lines) + ("\n" if failure_lines else ""), encoding="utf-8")
-    print(f"[done] eval report -> {args.output_path}")
-    print(f"[done] eval failures -> {args.fail_path}")
+    report_index = _next_index(args.output_dir, "eval_report")
+    failure_index = _next_index(args.output_dir, "eval_failures")
+    report_path = args.output_dir / f"eval_report_{report_index}.jsonl"
+    failure_path = args.output_dir / f"eval_failures_{failure_index}.jsonl"
+    report_path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    failure_path.write_text("\n".join(failure_lines) + ("\n" if failure_lines else ""), encoding="utf-8")
+    print(f"[done] eval report -> {report_path}")
+    print(f"[done] eval failures -> {failure_path}")
     return 1 if failed else 0
 
 
