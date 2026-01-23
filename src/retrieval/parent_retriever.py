@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -172,6 +173,48 @@ def _distance_to_score(distance: float) -> float:
     return 1.0 / (1.0 + distance)
 
 
+def _is_multi_intent(query: str) -> bool:
+    keywords = [
+        "推荐",
+        "几个",
+        "几道",
+        "几种",
+        "一些",
+        "多种",
+        "有哪些",
+        "推荐一下",
+        "推荐点",
+        "来点",
+        "给点",
+    ]
+    return any(k in query for k in keywords)
+
+
+def _parse_cn_count(text: str) -> Optional[int]:
+    mapping = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    if text == "十":
+        return 10
+    if "十" in text:
+        parts = text.split("十")
+        tens = mapping.get(parts[0], 1) if parts[0] else 1
+        ones = mapping.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+        return tens * 10 + ones
+    return mapping.get(text)
+
+
+def _recommend_count(query: str) -> Optional[int]:
+    if not _is_multi_intent(query):
+        return None
+    match = re.search(r"([一二三四五六七八九十两\\d]+)\\s*(?:道|个|种|份|款)", query)
+    if match:
+        return _parse_cn_count(match.group(1))
+    return 3
+
+
 def aggregate_hits(
     res: Dict,
     *,
@@ -296,6 +339,7 @@ def _retrieve_state(
     any_eligible = any(ph.coverage_ratio >= coverage_threshold for ph in parents)
     t_min = 0.40
     auto_recommend = True
+    force_allow_multiple = _is_multi_intent(query)
     parent_lock = ParentLock(
         status="none",
         parent_id=None,
@@ -319,6 +363,10 @@ def _retrieve_state(
             for ph in parents:
                 ph.good_but_ambiguous = True
             auto_recommend = False
+    if force_allow_multiple and parents and auto_recommend:
+        for ph in parents:
+            ph.good_but_ambiguous = True
+        auto_recommend = False
     if auto_recommend:
         for ph in parents:
             ph.auto_recommend = True
@@ -338,7 +386,7 @@ def _retrieve_state(
             lock_reason=None,
             lock_score=None,
             locked_at_turn=turn,
-            pending_reason="ambiguous_top1_top2",
+            pending_reason="multi_intent" if force_allow_multiple else "ambiguous_top1_top2",
         )
     for ph in parents[:top_parents]:
         ph.parent_doc = load_parent_doc(ph.parent_id)
@@ -729,8 +777,10 @@ def _build_output_from_state(
         }
 
     if parent_lock.status == "pending":
+        desired_count = _recommend_count(query)
         candidates = []
-        for idx, ph in enumerate(parents, 1):
+        limited_parents = parents[:desired_count] if desired_count else parents
+        for idx, ph in enumerate(limited_parents, 1):
             item = {
                 "dish_name": ph.hits[0].metadata.get("dish_name") if ph.hits else None,
                 "overall_score": ph.overall_score,
@@ -1596,7 +1646,9 @@ def run_session_once(
     )
     if output.get("state") == "GOOD_BUT_AMBIGUOUS":
         pending_candidates = []
-        for idx, ph in enumerate(state.parents, 1):
+        desired_count = _recommend_count(query)
+        limited_parents = state.parents[:desired_count] if desired_count else state.parents
+        for idx, ph in enumerate(limited_parents, 1):
             pending_candidates.append(
                 {
                     "option_id": str(idx),
@@ -1606,10 +1658,11 @@ def run_session_once(
                 }
             )
         top1_score = state.parents[0].overall_score if state.parents else None
+        pending_reason = "multi_intent" if _is_multi_intent(query) else "ambiguous_top1_top2"
         session["parent_lock"] = {
             "status": "pending",
             "parent_id": None,
-            "pending_reason": "ambiguous_top1_top2",
+            "pending_reason": pending_reason,
             "lock_score": top1_score,
             "lock_reason": None,
         }
