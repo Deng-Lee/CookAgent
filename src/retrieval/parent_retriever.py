@@ -84,6 +84,12 @@ from session_utils import load_session, parse_option_id, purge_expired_pending, 
 DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
 DISH_TITLE_MIN = 0.8
 
+EXCLUDED_CATEGORY_SYNONYMS = {
+    "示例菜": ["示例菜"],
+    "调料": ["调料", "调味料", "调味品"],
+    "半成品": ["半成品", "半成品菜"],
+}
+
 CATEGORY_SYNONYMS = {
     "素菜": ["素", "素菜", "素食", "无肉"],
     "荤菜": ["荤", "荤菜", "肉", "肉菜", "有肉"],
@@ -99,6 +105,11 @@ CATEGORY_SYNONYMS = {
 def detect_categories(query: str) -> List[str]:
     hits = []
     text = query or ""
+    for category, words in EXCLUDED_CATEGORY_SYNONYMS.items():
+        if any(word in text for word in words):
+            hits.append(category)
+    if hits:
+        return hits
     for category, words in CATEGORY_SYNONYMS.items():
         if any(word in text for word in words):
             hits.append(category)
@@ -156,11 +167,16 @@ def resolve_category_choice(query: str, pending: List[Dict]) -> Optional[str]:
     return None
 
 
-def build_category_where_filter(dir_category: Optional[str]) -> Optional[Dict]:
+def build_category_where_filter(
+    dir_category: Optional[str],
+    *,
+    allow_excluded: bool = False,
+) -> Optional[Dict]:
     filters = []
     if dir_category:
         filters.append({"dir_category": dir_category})
-    filters.append({"is_excluded_default": False})
+    if not allow_excluded:
+        filters.append({"is_excluded_default": False})
     if not filters:
         return None
     if len(filters) == 1:
@@ -332,7 +348,8 @@ def _retrieve_state(
         embedding_function=embedding_fn,
     )
 
-    where_filter = build_category_where_filter(dir_category)
+    allow_excluded = bool(dir_category in DEFAULT_EXCLUDED_CATEGORIES)
+    where_filter = build_category_where_filter(dir_category, allow_excluded=allow_excluded)
     res = collection.query(query_texts=[query], n_results=top_k, where=where_filter)
     parents = aggregate_hits(res)
     coverage_threshold = 0.5
