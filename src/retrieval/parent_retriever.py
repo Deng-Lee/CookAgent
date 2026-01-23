@@ -227,6 +227,12 @@ def aggregate_hits(
     eps = 1e-8
     eligible = [ph for ph in parents.values() if ph.coverage_ratio >= coverage_threshold]
     if eligible:
+        if len(eligible) == 1:
+            only = eligible[0]
+            only.rrf_sum_norm = 1.0
+            only.max_chunk_norm = 1.0
+            only.overall_score = 1.0
+            return eligible
         min_rrf = min(p.rrf_sum for p in eligible)
         max_rrf = max(p.rrf_sum for p in eligible)
         min_max = min(p.max_chunk_score for p in eligible)
@@ -761,6 +767,7 @@ def run_once(
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
+    generation_log_path: Optional[Path] = None,
     evidence_insufficient: Optional[Dict] = None,
     turn: Optional[int] = None,
     llm_call_extractor: Optional[LLMCall] = None,
@@ -803,7 +810,7 @@ def run_once(
                 include_candidates=False,
                 session_id=None,
                 turn=turn,
-                generation_log_path=DEFAULT_GENERATION_LOG,
+                generation_log_path=generation_log_path or DEFAULT_GENERATION_LOG,
                 evidence_log_path=evidence_log_path,
             )
         return {
@@ -834,7 +841,7 @@ def run_once(
         include_candidates=False,
         session_id=None,
         turn=turn,
-        generation_log_path=DEFAULT_GENERATION_LOG,
+        generation_log_path=generation_log_path or DEFAULT_GENERATION_LOG,
         evidence_log_path=evidence_log_path,
         llm_call_extractor=llm_call_extractor,
         llm_call_polish=llm_call_polish,
@@ -854,11 +861,13 @@ def run_session_once(
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
     evidence_log_path: Optional[Path] = None,
+    generation_log_path: Optional[Path] = None,
     evidence_insufficient: Optional[Dict] = None,
     turn: Optional[int] = None,
     llm_call_extractor: Optional[LLMCall] = None,
     llm_call_polish: Optional[LLMCall] = None,
 ) -> Dict:
+    generation_log_path = generation_log_path or DEFAULT_GENERATION_LOG
     print("正在对相关文档进行排序...")
     phase_ts = time.time()
     session = load_session(session_id)
@@ -985,7 +994,7 @@ def run_session_once(
                             "ratio12": None,
                         },
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 mapping = build_generation_mapping(output_intent, evidence_set)
                 log_generation_mapping(
@@ -996,7 +1005,7 @@ def run_session_once(
                         "mapping_strategy": "by_block_type_v1",
                         "sections": mapping,
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 answer = format_auto_answer(evidence_set)
                 print(f"抽取/生成耗时: {time.time() - phase_ts:.2f}s")
@@ -1055,7 +1064,7 @@ def run_session_once(
                         },
                         "error": {"type": None, "message": None},
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 if llm_call_polish:
                     print(f"润色耗时: {time.time() - phase_ts:.2f}s")
@@ -1090,7 +1099,7 @@ def run_session_once(
                     },
                     "error": {"type": None, "message": None},
                 },
-                log_path=DEFAULT_GENERATION_LOG,
+                log_path=generation_log_path,
             )
             state = (
                 "EVIDENCE_INSUFFICIENT"
@@ -1405,7 +1414,7 @@ def run_session_once(
                             "ratio12": None,
                         },
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 mapping = build_generation_mapping(output_intent, final_evidence)
                 log_generation_mapping(
@@ -1416,7 +1425,7 @@ def run_session_once(
                         "mapping_strategy": "by_block_type_v1",
                         "sections": mapping,
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 log_generation_completed(
                     {
@@ -1439,7 +1448,7 @@ def run_session_once(
                         },
                         "error": {"type": None, "message": None},
                     },
-                    log_path=DEFAULT_GENERATION_LOG,
+                    log_path=generation_log_path,
                 )
                 if polish_output_ts:
                     print(f"润色后到输出耗时: {time.time() - polish_output_ts:.2f}s")
@@ -1499,7 +1508,7 @@ def run_session_once(
                     },
                     "error": {"type": None, "message": None},
                 },
-                log_path=DEFAULT_GENERATION_LOG,
+                log_path=generation_log_path,
             )
             state = (
                 "EVIDENCE_INSUFFICIENT"
@@ -1580,6 +1589,7 @@ def run_session_once(
         trace_id,
         state,
         include_candidates=True,
+        generation_log_path=generation_log_path,
         evidence_log_path=evidence_log_path,
         llm_call_extractor=llm_call_extractor,
         llm_call_polish=llm_call_polish,

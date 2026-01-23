@@ -71,7 +71,27 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("result"))
     args = parser.parse_args()
 
-    items = _load_jsonl(args.eval_path)
+    eval_log_path = project_root / "logs" / "retrieval_eval_runner.log"
+    eval_lock_log_path = project_root / "logs" / "parent_locking_eval_runner.log"
+    eval_evidence_log_path = project_root / "logs" / "evidence_driven_eval_runner.log"
+    eval_generation_log_path = project_root / "logs" / "generation_eval_runner.log"
+    eval_log_path.parent.mkdir(parents=True, exist_ok=True)
+    eval_log_path.write_text("", encoding="utf-8")
+    eval_lock_log_path.write_text("", encoding="utf-8")
+    eval_evidence_log_path.write_text("", encoding="utf-8")
+    eval_generation_log_path.write_text("", encoding="utf-8")
+
+    eval_path = args.eval_path
+    if not eval_path.exists():
+        fallback_path = Path("result/eval_set_v1.jsonl")
+        if fallback_path.exists():
+            eval_path = fallback_path
+        else:
+            raise FileNotFoundError(
+                f"Eval set not found at {args.eval_path} or {fallback_path}. "
+                "Provide --eval-path or create the file locally."
+            )
+    items = _load_jsonl(eval_path)
     passed = 0
     failed = 0
     output_lines: List[str] = []
@@ -87,9 +107,10 @@ def main() -> int:
             session_id=f"eval_{run_id}_{eval_id}",
             db_path=args.db_path,
             collection_name=args.collection,
-            log_path=project_root / "logs" / "retriever.log",
-            lock_log_path=project_root / "logs" / "parent_locking.log",
-            evidence_log_path=project_root / "logs" / "evidence_driven.log",
+            log_path=eval_log_path,
+            lock_log_path=eval_lock_log_path,
+            evidence_log_path=eval_evidence_log_path,
+            generation_log_path=eval_generation_log_path,
         )
 
         ok_state = _state_matches(expected.get("state"), result.get("state"))
