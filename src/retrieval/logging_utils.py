@@ -23,6 +23,10 @@ def log_retrieval(
     category_filter_applied: bool = False,
     category_conflict: bool = False,
     category_filtered_count: Optional[int] = None,
+    top1_chunk_score: Optional[float] = None,
+    top1_title_hit: Optional[bool] = None,
+    unclassifiable: Optional[bool] = None,
+    unclassifiable_reasons: Optional[List[str]] = None,
     log_path: Path = Path("logs/retriever.log"),
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +87,10 @@ def log_retrieval(
         "category_filter_applied": category_filter_applied,
         "category_conflict": category_conflict,
         "category_filtered_count": category_filtered_count,
+        "top1_chunk_score": top1_chunk_score,
+        "top1_title_hit": top1_title_hit,
+        "unclassifiable": unclassifiable,
+        "unclassifiable_reasons": unclassifiable_reasons or [],
     }
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")

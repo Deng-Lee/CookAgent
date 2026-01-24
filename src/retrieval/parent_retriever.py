@@ -83,6 +83,8 @@ from session_utils import load_session, parse_option_id, purge_expired_pending, 
 
 DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
 DISH_TITLE_MIN = 0.8
+S_MIN = 0.72
+S_MIN_RECOMMEND = 0.68
 
 EXCLUDED_CATEGORY_SYNONYMS = {
     "示例菜": ["示例菜"],
@@ -204,6 +206,11 @@ def _is_multi_intent(query: str) -> bool:
         "给点",
     ]
     return any(k in query for k in keywords)
+
+
+def _is_recipe_intent(query: str) -> bool:
+    keywords = ["怎么做", "做法", "步骤", "教程", "流程", "方法"]
+    return any(k in (query or "") for k in keywords)
 
 
 def _parse_cn_count(text: str) -> Optional[int]:
@@ -351,9 +358,24 @@ def _retrieve_state(
     allow_excluded = bool(dir_category in DEFAULT_EXCLUDED_CATEGORIES)
     where_filter = build_category_where_filter(dir_category, allow_excluded=allow_excluded)
     res = collection.query(query_texts=[query], n_results=top_k, where=where_filter)
+    ids = res.get("ids", [[]])[0]
+    metadatas = res.get("metadatas", [[]])[0]
+    distances = res.get("distances", [[]])[0]
+    top1_chunk_score = None
+    if distances:
+        top1_chunk_score = _distance_to_score(distances[0])
+    top1_title_hit = False
+    for hit_id, meta, dist in zip(ids, metadatas, distances):
+        score = _distance_to_score(dist)
+        meta_category = meta.get("category") if isinstance(meta, dict) else None
+        if (meta_category == "Title" or str(hit_id).endswith("-title")) and score >= DISH_TITLE_MIN:
+            top1_title_hit = True
+            break
+
     parents = aggregate_hits(res)
     coverage_threshold = 0.5
-    any_eligible = any(ph.coverage_ratio >= coverage_threshold for ph in parents)
+    eligible_parents = [ph for ph in parents if ph.coverage_ratio >= coverage_threshold]
+    any_eligible = bool(eligible_parents)
     t_min = 0.40
     auto_recommend = True
     force_allow_multiple = _is_multi_intent(query)
@@ -365,6 +387,44 @@ def _retrieve_state(
         locked_at_turn=turn,
         pending_reason=None,
     )
+    low_evidence_reasons = []
+    if top1_chunk_score is not None:
+        min_score = S_MIN_RECOMMEND if _is_multi_intent(query) else S_MIN
+        if top1_chunk_score < min_score:
+            low_evidence_reasons.append("top1_below_min")
+    if not top1_title_hit and not _is_recipe_intent(query) and not _is_multi_intent(query):
+        low_evidence_reasons.append("no_title_non_recipe")
+    if not any_eligible:
+        low_evidence_reasons.append("no_eligible_parents")
+    if parents and parents[0].overall_score < t_min:
+        low_evidence_reasons.append("top1_parent_below_tmin")
+    if low_evidence_reasons:
+        for ph in parents:
+            ph.low_evidence = True
+        auto_recommend = False
+        if log_path:
+            detected_categories = detect_categories(query)
+            log_retrieval(
+                query,
+                res,
+                parents[:top_parents],
+                detected_categories=detected_categories,
+                category_filter_applied=bool(dir_category),
+                category_conflict=len(detected_categories) > 1,
+                category_filtered_count=len(parents[:top_parents]),
+                top1_chunk_score=top1_chunk_score,
+                top1_title_hit=top1_title_hit,
+                unclassifiable=True,
+                unclassifiable_reasons=low_evidence_reasons,
+                log_path=log_path,
+            )
+        if lock_log_path:
+            log_parent_lock(query, parent_lock, parents[:top_parents], log_path=lock_log_path)
+        return RetrievalState(
+            parents=parents[:top_parents],
+            parent_lock=parent_lock,
+            evidence_set=None,
+        )
     if not any_eligible:
         for ph in parents:
             ph.low_evidence = True
@@ -418,6 +478,8 @@ def _retrieve_state(
             category_filter_applied=bool(dir_category),
             category_conflict=len(detected_categories) > 1,
             category_filtered_count=len(parents[:top_parents]),
+            top1_chunk_score=top1_chunk_score,
+            top1_title_hit=top1_title_hit,
             log_path=log_path,
         )
     if lock_log_path:
