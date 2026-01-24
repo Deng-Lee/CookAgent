@@ -24,7 +24,7 @@ AMBIGUOUS_RATIO = 0.8
 # Title chunk similarity required to treat top1 as a title hit.
 DISH_TITLE_MIN = 0.8
 # Minimum top1 chunk score for single-intent queries.
-S_MIN = 0.72
+S_MIN = 0.75
 # Minimum top1 chunk score for multi-intent (recommend) queries.
 S_MIN_RECOMMEND = 0.68
 
