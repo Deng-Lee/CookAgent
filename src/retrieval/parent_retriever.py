@@ -82,6 +82,7 @@ from session_utils import load_session, parse_option_id, purge_expired_pending, 
 from config import (
     AMBIGUOUS_RATIO,
     CATEGORY_SYNONYMS,
+    COVERAGE_WEIGHT,
     COVERAGE_THRESHOLD,
     DEFAULT_EXCLUDED_CATEGORIES,
     DISH_TITLE_MIN,
@@ -271,7 +272,7 @@ def aggregate_hits(
         else:
             ph.coverage_ratio = 0.0
 
-    # Normalize rrf_sum and max_chunk_score for parents that pass coverage threshold.
+    # Normalize mean RRF and max_chunk_score for parents that pass coverage threshold.
     coverage_threshold = COVERAGE_THRESHOLD
     eps = 1e-8
     eligible = [ph for ph in parents.values() if ph.coverage_ratio >= coverage_threshold]
@@ -282,16 +283,28 @@ def aggregate_hits(
             only.max_chunk_norm = 1.0
             only.overall_score = 1.0
             return eligible
-        min_rrf = min(p.rrf_sum for p in eligible)
-        max_rrf = max(p.rrf_sum for p in eligible)
+        rrf_means = []
+        for p in eligible:
+            coverage_raw = p.coverage or 1
+            rrf_means.append(p.rrf_sum / coverage_raw)
+        min_rrf = min(rrf_means)
+        max_rrf = max(rrf_means)
         min_max = min(p.max_chunk_score for p in eligible)
         max_max = max(p.max_chunk_score for p in eligible)
         w1 = RRF_WEIGHT
         w2 = MAX_CHUNK_WEIGHT
+        w3 = COVERAGE_WEIGHT
         for ph in eligible:
-            ph.rrf_sum_norm = (ph.rrf_sum - min_rrf) / (max_rrf - min_rrf + eps)
+            coverage_raw = ph.coverage or 1
+            rrf_mean = ph.rrf_sum / coverage_raw
+            if len(eligible) <= 2:
+                ph.rrf_sum_norm = rrf_mean / (max_rrf + eps)
+            else:
+                ph.rrf_sum_norm = (rrf_mean - min_rrf) / (max_rrf - min_rrf + eps)
             ph.max_chunk_norm = (ph.max_chunk_score - min_max) / (max_max - min_max + eps)
-            ph.overall_score = w1 * ph.rrf_sum_norm + w2 * ph.max_chunk_norm
+            ph.overall_score = (
+                w1 * ph.rrf_sum_norm + w2 * ph.max_chunk_norm + w3 * ph.coverage_ratio
+            )
 
         # Sort only eligible parents by overall_score desc.
         return sorted(

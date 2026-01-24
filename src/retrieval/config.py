@@ -9,15 +9,17 @@ TOP_PARENTS = 5
 RRF_K = 60
 # Minimum coverage ratio to consider a parent eligible.
 COVERAGE_THRESHOLD = 0.5
-# Weight of RRF score in overall_score.
-RRF_WEIGHT = 0.7
+# Weight of mean RRF score in overall_score.
+RRF_WEIGHT = 0.35
 # Weight of max chunk score in overall_score.
-MAX_CHUNK_WEIGHT = 0.3
+MAX_CHUNK_WEIGHT = 0.55
+# Small bonus for coverage ratio to avoid over-penalizing long docs.
+COVERAGE_WEIGHT = 0.1
 
 # Minimum overall_score to treat top1 as valid.
-T_MIN = 0.40
+T_MIN = 0.6
 # Ambiguity trigger ratio: score2/score1 above this -> GOOD_BUT_AMBIGUOUS.
-AMBIGUOUS_RATIO = 0.92
+AMBIGUOUS_RATIO = 0.8
 
 # Title chunk similarity required to treat top1 as a title hit.
 DISH_TITLE_MIN = 0.8

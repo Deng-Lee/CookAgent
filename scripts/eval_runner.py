@@ -3,13 +3,13 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 project_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(project_root / "src"))
 sys.path.insert(0, str(project_root / "src" / "retrieval"))
 
-from retrieval.parent_retriever import run_session_once
+from retrieval.parent_retriever import run_session_once, retrieve, detect_categories
 
 
 def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -55,6 +55,40 @@ def _parent_matches(expected_ids: List[str], result: Dict[str, Any]) -> bool:
         if cand.get("parent_id") in expected_ids:
             return True
     return False
+
+
+def _score_from_candidates(candidates: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    scores = [
+        c.get("overall_score")
+        for c in candidates
+        if isinstance(c, dict) and isinstance(c.get("overall_score"), (int, float))
+    ]
+    if not scores:
+        return {"top1_overall_score": None, "score2_over_score1": None}
+    top1 = scores[0]
+    ratio = (scores[1] / scores[0]) if len(scores) > 1 and scores[0] else None
+    return {"top1_overall_score": top1, "score2_over_score1": ratio}
+
+
+def _score_from_retrieval(query: str, db_path: Path, collection: str) -> Dict[str, Optional[float]]:
+    categories = detect_categories(query)
+    dir_category = categories[0] if len(categories) == 1 else None
+    parents = retrieve(
+        query=query,
+        db_path=db_path,
+        collection_name=collection,
+        dir_category=dir_category,
+    )
+    if not parents:
+        return {"top1_overall_score": None, "score2_over_score1": None}
+    parents_sorted = sorted(parents, key=lambda p: p.overall_score, reverse=True)
+    top1 = parents_sorted[0].overall_score
+    ratio = (
+        (parents_sorted[1].overall_score / parents_sorted[0].overall_score)
+        if len(parents_sorted) > 1 and parents_sorted[0].overall_score
+        else None
+    )
+    return {"top1_overall_score": top1, "score2_over_score1": ratio}
 
 
 def _next_index(output_dir: Path, prefix: str) -> int:
@@ -118,10 +152,21 @@ def main() -> int:
         ok_parent = _parent_matches(expected.get("parent_ids") or [], result)
         ok = ok_state and ok_category and ok_parent
 
-        def _strip_answer(result_obj: Dict[str, Any]) -> Dict[str, Any]:
+        def _strip_result_fields(result_obj: Dict[str, Any]) -> Dict[str, Any]:
             if "answer" in result_obj:
                 result_obj = {**result_obj, "answer": None}
+            result_obj.pop("message", None)
+            result_obj.pop("clarify_question", None)
             return result_obj
+
+        scoring = {}
+        state = result.get("state")
+        if state not in {"LOW_EVIDENCE", "EVIDENCE_INSUFFICIENT"}:
+            candidates = result.get("candidates") or []
+            if candidates:
+                scoring = _score_from_candidates(candidates)
+            else:
+                scoring = _score_from_retrieval(query, args.db_path, args.collection)
 
         output_lines.append(
             json.dumps(
@@ -129,7 +174,7 @@ def main() -> int:
                     "id": eval_id,
                     "query": query,
                     "expected": expected,
-                    "result": _strip_answer(result),
+                    "result": {**_strip_result_fields(result), **scoring},
                     "pass": ok,
                 },
                 ensure_ascii=False,
@@ -146,7 +191,7 @@ def main() -> int:
                         "id": eval_id,
                         "query": query,
                         "expected": expected,
-                        "result": _strip_answer(result),
+                        "result": {**_strip_result_fields(result), **scoring},
                     },
                     ensure_ascii=False,
                 )
