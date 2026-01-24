@@ -79,29 +79,26 @@ from retrieval_types import (
     DEFAULT_GENERATION_LOG,
 )
 from session_utils import load_session, parse_option_id, purge_expired_pending, save_session
-
-
-DEFAULT_EXCLUDED_CATEGORIES = {"示例菜", "调料", "半成品"}
-DISH_TITLE_MIN = 0.8
-S_MIN = 0.72
-S_MIN_RECOMMEND = 0.68
-
-EXCLUDED_CATEGORY_SYNONYMS = {
-    "示例菜": ["示例菜"],
-    "调料": ["调料", "调味料", "调味品"],
-    "半成品": ["半成品", "半成品菜"],
-}
-
-CATEGORY_SYNONYMS = {
-    "素菜": ["素", "素菜", "素食", "无肉"],
-    "荤菜": ["荤", "荤菜", "肉", "肉菜", "有肉"],
-    "水产": ["水产", "海鲜", "鱼", "虾", "蟹"],
-    "汤": ["汤", "羹", "煲汤"],
-    "甜点": ["甜点", "甜品", "点心"],
-    "饮料": ["饮料", "饮品", "奶茶", "果汁"],
-    "早餐": ["早餐", "早饭", "早点"],
-    "主食": ["主食", "饭", "面", "粥", "饼"],
-}
+from config import (
+    AMBIGUOUS_RATIO,
+    CATEGORY_SYNONYMS,
+    COVERAGE_THRESHOLD,
+    DEFAULT_EXCLUDED_CATEGORIES,
+    DISH_TITLE_MIN,
+    EXCLUDED_CATEGORY_SYNONYMS,
+    MAX_CHUNK_WEIGHT,
+    MULTI_INTENT_DEFAULT_COUNT,
+    MULTI_INTENT_KEYWORDS,
+    RECIPE_INTENT_KEYWORDS,
+    RRF_K,
+    RRF_WEIGHT,
+    S_MIN,
+    S_MIN_RECOMMEND,
+    T_MIN,
+    TOP_K,
+    TOP_PARENTS,
+    INTENT_MIN,
+)
 
 
 def detect_categories(query: str) -> List[str]:
@@ -192,25 +189,11 @@ def _distance_to_score(distance: float) -> float:
 
 
 def _is_multi_intent(query: str) -> bool:
-    keywords = [
-        "推荐",
-        "几个",
-        "几道",
-        "几种",
-        "一些",
-        "多种",
-        "有哪些",
-        "推荐一下",
-        "推荐点",
-        "来点",
-        "给点",
-    ]
-    return any(k in query for k in keywords)
+    return any(k in query for k in MULTI_INTENT_KEYWORDS)
 
 
 def _is_recipe_intent(query: str) -> bool:
-    keywords = ["怎么做", "做法", "步骤", "教程", "流程", "方法"]
-    return any(k in (query or "") for k in keywords)
+    return any(k in (query or "") for k in RECIPE_INTENT_KEYWORDS)
 
 
 def _parse_cn_count(text: str) -> Optional[int]:
@@ -235,13 +218,13 @@ def _recommend_count(query: str) -> Optional[int]:
     match = re.search(r"([一二三四五六七八九十两\\d]+)\\s*(?:道|个|种|份|款)", query)
     if match:
         return _parse_cn_count(match.group(1))
-    return 3
+    return MULTI_INTENT_DEFAULT_COUNT
 
 
 def aggregate_hits(
     res: Dict,
     *,
-    k: int = 60,
+    k: int = RRF_K,
 ) -> List[ParentHit]:
     """
     Aggregate chunk-level hits into parent-level scores using RRF sum + max score.
@@ -289,7 +272,7 @@ def aggregate_hits(
             ph.coverage_ratio = 0.0
 
     # Normalize rrf_sum and max_chunk_score for parents that pass coverage threshold.
-    coverage_threshold = 0.5
+    coverage_threshold = COVERAGE_THRESHOLD
     eps = 1e-8
     eligible = [ph for ph in parents.values() if ph.coverage_ratio >= coverage_threshold]
     if eligible:
@@ -303,8 +286,8 @@ def aggregate_hits(
         max_rrf = max(p.rrf_sum for p in eligible)
         min_max = min(p.max_chunk_score for p in eligible)
         max_max = max(p.max_chunk_score for p in eligible)
-        w1 = 0.7
-        w2 = 0.3
+        w1 = RRF_WEIGHT
+        w2 = MAX_CHUNK_WEIGHT
         for ph in eligible:
             ph.rrf_sum_norm = (ph.rrf_sum - min_rrf) / (max_rrf - min_rrf + eps)
             ph.max_chunk_norm = (ph.max_chunk_score - min_max) / (max_max - min_max + eps)
@@ -335,8 +318,8 @@ def _retrieve_state(
     db_path: Path,
     collection_name: str,
     *,
-    top_k: int = 25,
-    top_parents: int = 5,
+    top_k: int = TOP_K,
+    top_parents: int = TOP_PARENTS,
     dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
@@ -373,10 +356,10 @@ def _retrieve_state(
             break
 
     parents = aggregate_hits(res)
-    coverage_threshold = 0.5
+    coverage_threshold = COVERAGE_THRESHOLD
     eligible_parents = [ph for ph in parents if ph.coverage_ratio >= coverage_threshold]
     any_eligible = bool(eligible_parents)
-    t_min = 0.40
+    t_min = T_MIN
     auto_recommend = True
     force_allow_multiple = _is_multi_intent(query)
     parent_lock = ParentLock(
@@ -436,7 +419,7 @@ def _retrieve_state(
     if parents and parents[0].overall_score > t_min and len(parents) > 1:
         score1 = parents[0].overall_score
         score2 = parents[1].overall_score
-        if score1 > 0 and (score2 / score1) > 0.92:
+        if score1 > 0 and (score2 / score1) > AMBIGUOUS_RATIO:
             for ph in parents:
                 ph.good_but_ambiguous = True
             auto_recommend = False
@@ -510,8 +493,8 @@ def retrieve(
     db_path: Path,
     collection_name: str,
     *,
-    top_k: int = 25,
-    top_parents: int = 5,
+    top_k: int = TOP_K,
+    top_parents: int = TOP_PARENTS,
     dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
@@ -890,8 +873,8 @@ def run_once(
     *,
     db_path: Path,
     collection_name: str,
-    top_k: int = 25,
-    top_parents: int = 5,
+    top_k: int = TOP_K,
+    top_parents: int = TOP_PARENTS,
     dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
@@ -984,8 +967,8 @@ def run_session_once(
     *,
     db_path: Path,
     collection_name: str,
-    top_k: int = 25,
-    top_parents: int = 5,
+    top_k: int = TOP_K,
+    top_parents: int = TOP_PARENTS,
     dir_category: Optional[str] = None,
     log_path: Optional[Path] = None,
     lock_log_path: Optional[Path] = None,
@@ -1262,7 +1245,7 @@ def run_session_once(
             slots = routing["slots"]
             print(f"意图识别完成：{intent}（置信度 {confidence:.2f}）。")
             print(f"意图识别详情: intent={intent}, confidence={confidence:.2f}, slots={slots}")
-            intent_min = 0.5
+            intent_min = INTENT_MIN
             layer1_blocks = route_blocks(intent) if confidence >= intent_min else []
             selected_blocks = layer1_blocks
             evidence_layer1 = build_layer_evidence(evidence_set, layer1_blocks) if layer1_blocks else None

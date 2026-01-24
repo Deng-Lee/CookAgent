@@ -3,6 +3,16 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from config import (
+    ASK_STEP_N_SCORE,
+    ASK_STEPS_SCORE,
+    ASK_INGREDIENTS_SCORE,
+    ASK_INGREDIENTS_QUANTITY_SCORE,
+    ASK_TIME_SCORE,
+    ASK_HEAT_SCORE,
+    ASK_SUBSTITUTION_SCORE,
+    ASK_TIPS_SCORE,
+)
 
 _BLOCK_ALIASES = {
     "Intro": "intro",
@@ -61,31 +71,34 @@ def classify_query(query: str) -> Dict:
         m = re.search(r"第(\d+)步", text)
         if m:
             slots["step_n"] = int(m.group(1))
-        scores["ASK_STEP_N"] = 0.95
+        scores["ASK_STEP_N"] = ASK_STEP_N_SCORE
     if re.search(r"第\s*([一二三四五六七八九十两]+)\s*步", text):
         m = re.search(r"第\s*([一二三四五六七八九十两]+)\s*步", text)
         if m:
             step_n = _parse_cn_number(m.group(1))
             if step_n:
                 slots["step_n"] = step_n
-        scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), 0.95)
+        scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), ASK_STEP_N_SCORE)
     if re.search(r"第一步|第1步", text):
         slots["step_n"] = 1
-        scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), 0.95)
+        scores["ASK_STEP_N"] = max(scores.get("ASK_STEP_N", 0.0), ASK_STEP_N_SCORE)
     if re.search(r"怎么做|步骤|流程|做法", text):
-        scores["ASK_STEPS"] = max(scores.get("ASK_STEPS", 0.0), 0.7)
+        scores["ASK_STEPS"] = max(scores.get("ASK_STEPS", 0.0), ASK_STEPS_SCORE)
     if re.search(r"原料|材料|食材|需要什么|用什么|用料", text):
-        scores["ASK_INGREDIENTS"] = max(scores.get("ASK_INGREDIENTS", 0.0), 0.8)
+        scores["ASK_INGREDIENTS"] = max(scores.get("ASK_INGREDIENTS", 0.0), ASK_INGREDIENTS_SCORE)
     if re.search(r"多少|几克|几勺|用量", text):
-        scores["ASK_INGREDIENTS"] = max(scores.get("ASK_INGREDIENTS", 0.0), 0.6)
+        scores["ASK_INGREDIENTS"] = max(
+            scores.get("ASK_INGREDIENTS", 0.0),
+            ASK_INGREDIENTS_QUANTITY_SCORE,
+        )
     if re.search(r"多久|几分钟|多长时间|炖多久|煮多久", text):
-        scores["ASK_TIME"] = max(scores.get("ASK_TIME", 0.0), 0.8)
+        scores["ASK_TIME"] = max(scores.get("ASK_TIME", 0.0), ASK_TIME_SCORE)
     if re.search(r"大火|小火|中火|火候|火力", text):
-        scores["ASK_HEAT"] = max(scores.get("ASK_HEAT", 0.0), 0.8)
+        scores["ASK_HEAT"] = max(scores.get("ASK_HEAT", 0.0), ASK_HEAT_SCORE)
     if re.search(r"可以不放|能换|替代|没有.+怎么办", text):
-        scores["ASK_SUBSTITUTION"] = max(scores.get("ASK_SUBSTITUTION", 0.0), 0.7)
+        scores["ASK_SUBSTITUTION"] = max(scores.get("ASK_SUBSTITUTION", 0.0), ASK_SUBSTITUTION_SCORE)
     if re.search(r"注意什么|技巧|为什么|更好吃|避免", text):
-        scores["ASK_TIPS"] = max(scores.get("ASK_TIPS", 0.0), 0.7)
+        scores["ASK_TIPS"] = max(scores.get("ASK_TIPS", 0.0), ASK_TIPS_SCORE)
 
     if not scores:
         return {"intent": "UNKNOWN", "confidence": 0.0, "slots": {}}
